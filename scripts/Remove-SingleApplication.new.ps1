@@ -7,12 +7,6 @@ param(
 )
 
 # ---- Registry lookup (reused from Find-AppUninstallInfo.ps1) ----
-$uninstallPaths = @(
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
-    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
-)
-
 function Normalize-Name([string]$s) {
     if (-not $s) { return "" }
     ($s.ToLower() -replace '[^a-z0-9]+',' ').Trim() -replace '\s+',' '
@@ -89,6 +83,79 @@ function Write-UninstallMethod([string]$Method) {
 function Get-WingetFlatText([string]$Text) {
     if (-not $Text) { return "" }
     (($Text -replace '\x00', '') -replace ' (?=[A-Za-z])', '')
+}
+
+function Test-IsProcessElevated {
+    $principal = New-Object Security.Principal.WindowsPrincipal(
+        [Security.Principal.WindowsIdentity]::GetCurrent())
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-WingetMessage([string]$Output, [string]$Pattern) {
+    if (-not $Output -or -not $Pattern) { return $false }
+    if ($Output -match $Pattern) { return $true }
+    $compactOut = ((Get-WingetFlatText $Output) -replace '\s', '')
+    $compactPat = $Pattern -replace '\s', ''
+    return ($compactOut -match $compactPat)
+}
+
+function Get-UninstallRegistryApps {
+    $roots = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKCU:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+    $result = @()
+    foreach ($root in $roots) {
+        if (-not (Test-Path $root)) { continue }
+        Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                $item = Get-ItemProperty $_.PSPath -ErrorAction Stop
+                if ($item.DisplayName) { $result += $item }
+            } catch { }
+        }
+    }
+    $result
+}
+
+function Find-SquirrelUninstall([string]$Name) {
+    if (-not $Name) { return $null }
+    $dirs = @(
+        (Join-Path $env:LOCALAPPDATA $Name),
+        (Join-Path $env:LOCALAPPDATA "$Name\$Name")
+    )
+    foreach ($dir in $dirs) {
+        $exe = Join-Path $dir 'Update.exe'
+        if (-not (Test-Path $exe)) { continue }
+        return [pscustomobject]@{
+            DisplayName          = $Name
+            Publisher            = $null
+            DisplayVersion       = $null
+            InstallLocation      = $dir
+            UninstallString      = "`"$exe`" --uninstall"
+            QuietUninstallString = "`"$exe`" --uninstall -s"
+            WindowsInstaller     = 0
+            PSChildName          = $Name
+            PSPath               = $null
+            NormName             = (Normalize-Name $Name)
+        }
+    }
+    $null
+}
+
+function Stop-MatchingProcesses([string]$Name) {
+    if (-not $Name -or $Name.Trim().Length -lt 4) { return }
+    $n = Normalize-Name $Name
+    Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        $pName = Normalize-Name $_.ProcessName
+        $pName -eq $n -or $pName -like "$n *"
+    } | ForEach-Object {
+        try {
+            Write-Host "Stopping process: $($_.ProcessName) (PID $($_.Id))"
+            Stop-Process -Id $_.Id -Force -ErrorAction Stop
+        } catch { }
+    }
 }
 
 function Get-WingetPath {
@@ -178,8 +245,56 @@ function Invoke-WingetUninstallUnelevated {
     [pscustomobject]@{ ExitCode = [int]$code; Output = ($output -join "`n") }
 }
 
+function Invoke-WingetUninstallWithFallback {
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [string]$Name
+    )
+
+    $common = @('--silent', '--disable-interactivity', '--accept-source-agreements')
+    $argSets = New-Object 'System.Collections.Generic.List[object]'
+    if ($Id)   { [void]$argSets.Add(@('uninstall', '--id', $Id) + $common) }
+    if ($Name) { [void]$argSets.Add(@('uninstall', '--name', $Name) + $common) }
+    if ($Name) { [void]$argSets.Add(@('uninstall', $Name) + $common) }
+
+    $elevated = Test-IsProcessElevated
+    $modes = @($false)
+    if ($elevated) { $modes += $true }
+
+    $last = $null
+    foreach ($unelevated in $modes) {
+        foreach ($wingetArgs in $argSets) {
+            if ($unelevated) {
+                $last = Invoke-WingetUninstallUnelevated -WingetArgs $wingetArgs
+            } else {
+                $last = Invoke-WingetUninstallDirect -WingetArgs $wingetArgs
+            }
+
+            $out  = $last.Output
+            $code = [int]$last.ExitCode
+            if ($code -eq 0 -or (Test-WingetMessage $out 'Successfully uninstalled')) {
+                $last.ExitCode = 0
+                return $last
+            }
+
+            $adminBlocked = Test-WingetMessage $out 'installed for user scope cannot be uninstalled when running with administrator privileges'
+            if ($adminBlocked -and -not $unelevated -and $elevated) {
+                break
+            }
+        }
+    }
+    return $last
+}
+
 function Find-StorePackage([string]$needle) {
-    $packages = @(Get-AppxPackage -ErrorAction SilentlyContinue)
+    if ($null -eq $script:AppxPackages) {
+        $packages = @(Get-AppxPackage -ErrorAction SilentlyContinue)
+        if (Test-IsProcessElevated) {
+            $packages += @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)
+        }
+        $script:AppxPackages = @($packages | Sort-Object PackageFullName -Unique)
+    }
+    $packages = $script:AppxPackages
     if (-not $packages) { return $null }
 
     $minScore = 70
@@ -214,22 +329,19 @@ function Find-StorePackage([string]$needle) {
     [pscustomobject]@{ Package = $best; Score = $bestScore }
 }
 
-$apps = Get-ItemProperty $uninstallPaths -ErrorAction SilentlyContinue |
-    Where-Object { $_.DisplayName } |
-    Select-Object DisplayName, Publisher, DisplayVersion, InstallLocation,
-                  UninstallString, QuietUninstallString, WindowsInstaller, PSChildName, PSPath
+function Find-RegistryMatch([string]$ApplicationName) {
+    $apps = @(Get-UninstallRegistryApps)
+    $apps | ForEach-Object {
+        $_ | Add-Member -NotePropertyName NormName -NotePropertyValue (Normalize-Name $_.DisplayName) -Force
+    }
 
-$apps | ForEach-Object {
-    $_ | Add-Member -NotePropertyName NormName -NotePropertyValue (Normalize-Name $_.DisplayName) -Force
-}
+    $needle = Normalize-Name $ApplicationName
+    $match = @($apps | Where-Object { $_.NormName -eq $needle })
+    $regScore = 0
+    if ($match.Count -gt 0) {
+        return [pscustomobject]@{ Match = $match; Score = 100 }
+    }
 
-# ---- Find matching application (Win32 registry and Store/MSIX) ----
-$needle = Normalize-Name $ApplicationName
-$match = $apps | Where-Object { $_.NormName -eq $needle }
-$regScore = 0
-if ($match) {
-    $regScore = 100
-} else {
     $bestReg = $null
     foreach ($app in $apps) {
         $score = Get-MatchScore $app.DisplayName $ApplicationName
@@ -239,26 +351,56 @@ if ($match) {
         }
     }
     if ($regScore -ge 80) {
-        $match = $bestReg
-    } else {
-        $regScore = 0
+        return [pscustomobject]@{ Match = @($bestReg); Score = $regScore }
     }
+    [pscustomobject]@{ Match = @(); Score = 0 }
 }
 
-$storeHit = Find-StorePackage $needle
+# ---- Find matching application (Win32 registry, Squirrel, then Store/MSIX) ----
+# Store/Win32 bootstrappers (Discord) often finish after winget reports success.
+$needle = Normalize-Name $ApplicationName
+$match = @()
+$regScore = 0
+$storeHit = $null
 $storePkg = $null
 $storeScore = 0
-if ($storeHit) {
-    $storePkg = $storeHit.Package
-    $storeScore = [int]$storeHit.Score
-}
+$maxLookupAttempts = 6
 
-# Prefer the stronger identity. A weak registry prefix match must not beat
-# the real Store package (Windows App vs Windows App Certification Kit).
-if ($storeScore -gt $regScore) {
-    $match = $null
-} else {
+for ($lookupTry = 1; $lookupTry -le $maxLookupAttempts; $lookupTry++) {
+    $regHit = Find-RegistryMatch $ApplicationName
+    $match = @($regHit.Match)
+    $regScore = [int]$regHit.Score
+
+    if ($match.Count -eq 0) {
+        $squirrel = Find-SquirrelUninstall $ApplicationName
+        if ($squirrel) {
+            $match = @($squirrel)
+            $regScore = 100
+        }
+    }
+
+    $storeHit = Find-StorePackage $needle
     $storePkg = $null
+    $storeScore = 0
+    if ($storeHit) {
+        $storePkg = $storeHit.Package
+        $storeScore = [int]$storeHit.Score
+    }
+
+    # Prefer the stronger identity. A weak registry prefix match must not beat
+    # the real Store package (Windows App vs Windows App Certification Kit).
+    if ($storeScore -gt $regScore) {
+        $match = @()
+    } else {
+        $storePkg = $null
+    }
+
+    if ($match.Count -gt 0 -or $storePkg) { break }
+    if ($lookupTry -lt $maxLookupAttempts) {
+        Write-Host "App not visible yet; waiting for installer to finish ($lookupTry/$maxLookupAttempts)..."
+        Start-Sleep -Seconds 8
+        $script:AppxPackages = $null
+    }
 }
 
 # ---- Logging setup ----
@@ -291,26 +433,10 @@ if ($useWinget) {
     $displayName = $ApplicationName
     Write-Host "Name lookup missed '$ApplicationName'. Falling back to winget."
     Write-UninstallMethod 'winget'
+    Stop-MatchingProcesses $ApplicationName
 
-    $wingetArgs = @(
-        'uninstall', '--id', $Id,
-        '--silent', '--disable-interactivity', '--accept-source-agreements'
-    )
-
-    $result = Invoke-WingetUninstallDirect -WingetArgs $wingetArgs
-    $wingetExit = $result.ExitCode
-    $flat = Get-WingetFlatText $result.Output
-
-    $adminUserScope = $flat -match 'installed for user scope cannot be uninstalled when running with administrator privileges'
-    if ($wingetExit -ne 0 -and $adminUserScope) {
-        $result = Invoke-WingetUninstallUnelevated -WingetArgs $wingetArgs
-        $wingetExit = $result.ExitCode
-        $flat = Get-WingetFlatText $result.Output
-    }
-
-    if ($wingetExit -ne 0 -and $flat -match 'Successfully uninstalled') {
-        $wingetExit = 0
-    }
+    $result = Invoke-WingetUninstallWithFallback -Id $Id -Name $ApplicationName
+    $wingetExit = if ($result) { [int]$result.ExitCode } else { -1 }
     Write-Output "WINGET_EXIT=$wingetExit"
 } elseif ($storePkg) {
     $displayName = $ApplicationName
@@ -322,7 +448,11 @@ if ($useWinget) {
     Write-Host "Application found : $displayName (v$($storePkg.Version)) [Store/MSIX]"
     Write-Host "Using Remove-AppxPackage: $($storePkg.PackageFullName)"
     Write-UninstallMethod 'Remove-AppxPackage'
-    Remove-AppxPackage -Package $storePkg.PackageFullName
+    if (Test-IsProcessElevated) {
+        Remove-AppxPackage -Package $storePkg.PackageFullName -AllUsers
+    } else {
+        Remove-AppxPackage -Package $storePkg.PackageFullName
+    }
 } else {
     # Pick the best match (prefer entries that have a QuietUninstallString)
     $match = $match | Sort-Object {
@@ -338,6 +468,16 @@ if ($useWinget) {
     }
 
     Write-Host "Application found : $($match.DisplayName) (v$($match.DisplayVersion))"
+    Stop-MatchingProcesses $ApplicationName
+
+    # Squirrel (Discord, Slack, Teams classic, ...) uses Update.exe --uninstall -s
+    if (-not $quiet -and $match.UninstallString -match 'Update\.exe') {
+        if ($match.UninstallString -match '--uninstall') {
+            $quiet = ($match.UninstallString -replace '--uninstall.*', '--uninstall -s')
+        } else {
+            $quiet = "$($match.UninstallString) --uninstall -s"
+        }
+    }
 
     if ($quiet) {
         $methodName = if ($quiet -match 'msiexec') { 'msiexec' } else { 'QuietUninstallString' }
@@ -357,7 +497,8 @@ if ($useWinget) {
         }
 
         if ($args) {
-            Start-Process -FilePath $exe -ArgumentList $args -Wait -NoNewWindow
+            $argList = if ($args -match '"') { $args } else { @($args -split '\s+' | Where-Object { $_ }) }
+            Start-Process -FilePath $exe -ArgumentList $argList -Wait -NoNewWindow
         } else {
             Start-Process -FilePath $exe -Wait -NoNewWindow
         }
