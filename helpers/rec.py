@@ -96,8 +96,10 @@ def main():
     PID_FILE.write_text(str(proc.pid), encoding="utf-8")
     META_FILE.write_text(json.dumps({"out": out, "log": str(log_path), "started": time.time(), "grab": args.grab}, ensure_ascii=False))
 
+    print(f"\n**************************************************")
     print(f"Recording started (PID {proc.pid}). Writing to:\n{out}\n"
           f"To stop: python end_record.py", flush=True)
+    print(f"**************************************************\n")
     hide_ffmpeg_console(proc.pid)
 
 

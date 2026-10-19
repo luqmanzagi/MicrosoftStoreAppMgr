@@ -498,7 +498,8 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
     $uiBefore  = Get-VisibleWindowMap
 
     try {
-        $uniOutput = & $uninstallScript -ApplicationName $appName -Id $app.ID 2>&1
+        # *>&1 captures Write-Host (information stream) as well as success and error output.
+        $uniOutput = & $uninstallScript -ApplicationName $appName -Id $app.ID *>&1
         $uniExit   = $LASTEXITCODE
     }
     catch {
@@ -510,8 +511,25 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
         $elapsed = New-TimeSpan -Start $startTime -End $endTime
     }
 
+    $uniLines = @(
+        foreach ($item in @($uniOutput)) {
+            if ($null -eq $item) { continue }
+            $line = if ($item -is [System.Management.Automation.ErrorRecord]) {
+                $item.ToString()
+            } elseif ($item -is [System.Management.Automation.InformationRecord]) {
+                [string]$item.MessageData
+            } elseif ($item -is [System.Management.Automation.WarningRecord]) {
+                $item.Message
+            } else {
+                [string]$item
+            }
+            if ($line -match '\S') { Write-Log "    $line" }
+            $line
+        }
+    )
+
     # Check for errors in the output as well (Remove-SingleApplication uses Write-Error + exit 1)
-    $uniText = ($uniOutput | Out-String)
+    $uniText = ($uniLines -join "`n")
     $uniMethod = Get-UninstallMethod -Text $uniText
     if ($uniExit -ne 0) {
         $uniStatus = 'failure'
