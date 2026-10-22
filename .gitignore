@@ -25,6 +25,7 @@ jspm_packages/
 # Environment variables
 .env
 .env.*.local
+.cursor
 
 # Build output
 dist/
