@@ -1,10 +1,12 @@
 # Invoke-TestPower.ps1
 # For each app in result/app_1.json:
-#   1. Install it  (same logic as scripts/install.ps1)
-#   2. Stop processes that appeared since pre-ID (except the recorder), then
-#      uninstall if it was NOT already installed ('exist')
+#   1. Snapshot pre-ID, start recording, start mitm
+#   2. Install it  (same logic as scripts/install.ps1)
+#   3. Stop new processes (except recorder and mitm), then uninstall
+#      if it was NOT already installed ('exist')
 #      using scripts/Remove-SingleApplication.ps1
-#   3. After uninstall, stop leftover new processes, then stop the recording.
+#   4. Wait until the uninstall window is gone
+#   5. Stop leftover processes, stop mitm, then stop recording
 # Then move on to the next app.
 
 # -- Path setup --
@@ -13,7 +15,7 @@ if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
 $parentDir = Split-Path -Parent $scriptDir
 if (-not $parentDir) { $parentDir = (Get-Location).Path }
 
-$jsonPath          = Join-Path $parentDir 'results\app_2026-10-20.json'
+$jsonPath          = Join-Path $parentDir 'results\app_test.json'
 $uninstallScript   = Join-Path $scriptDir 'Remove-SingleApplication.new.ps1'
 
 # Validate required files
@@ -32,8 +34,18 @@ if (-not (Test-Path -LiteralPath $recDir)) {
     New-Item -ItemType Directory -Path $recDir -Force | Out-Null
 }
 
+$netdumpDir = Join-Path $parentDir 'results\netdump'
+if (-not (Test-Path -LiteralPath $netdumpDir)) {
+    New-Item -ItemType Directory -Path $netdumpDir -Force | Out-Null
+}
+
+$mitmLogDir = Join-Path $parentDir 'results\logs\mitmdump'
+if (-not (Test-Path -LiteralPath $mitmLogDir)) {
+    New-Item -ItemType Directory -Path $mitmLogDir -Force | Out-Null
+}
+
 # -- Logging --
-$logDir = Join-Path $parentDir 'logs\test'
+$logDir = Join-Path $parentDir 'results\logs\terminal'
 if (-not (Test-Path $logDir)) {
     New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 }
@@ -57,7 +69,7 @@ function Info($msg) {
 }
 
 function Warn($msg) {
-    Write-Log "[WARN ] $msg"
+    Write-Log "[WARN ] $msg" -ForegroundColor Yellow
 }
 
 # -- Load apps from JSON --
@@ -306,6 +318,58 @@ function Wait-UninstallUi {
     Write-Log "  Timed out waiting for the uninstall window to close."
 }
 
+$mitmCA = "$env:USERPROFILE\.mitmproxy\mitmproxy-ca-cert.pem"
+$env:SSL_CERT_FILE = $mitmCA
+$env:REQUESTS_CA_BUNDLE = $mitmCA
+
+function Start-Mitmdump {
+    param(
+        [string]$OutFile,
+        [string]$Mode = "local",
+        [string[]]$IgnoreHosts = @(),
+        [string]$LogFile = ""
+    )
+
+    if (-not (Get-Command mitmdump -ErrorAction SilentlyContinue)) {
+        throw "mitmdump not found on PATH."
+    }
+
+    $mitmArgs = @("--mode", $Mode, "-w", $OutFile)
+    foreach ($pat in $IgnoreHosts) {
+        $mitmArgs += @("--ignore-hosts", $pat)
+    }
+
+    $quotedArgs = $mitmArgs | ForEach-Object {
+        if ($_ -match '\s') { '"' + ($_ -replace '"','""') + '"' } else { $_ }
+    }
+    $argString = $quotedArgs -join ' '
+
+    Write-Log "  Start-Process mitmdump $argString"
+
+    $startParams = @{
+        FilePath     = "mitmdump"
+        ArgumentList = $argString
+        WindowStyle  = 'Hidden'
+        PassThru     = $true
+    }
+
+    if ($LogFile) {
+        $errPath = [IO.Path]::ChangeExtension($LogFile, ".err.log")
+        $startParams.RedirectStandardError  = $errPath
+        $startParams.RedirectStandardOutput = $LogFile
+    }
+
+    Start-Process @startParams
+}
+
+function Stop-Mitmdump {
+    param($Process)
+    if ($Process -and -not $Process.HasExited) {
+        Stop-Process -Id $Process.Id -Force
+        Start-Sleep -Milliseconds 250
+    }
+}
+
 function Stop-ScreenRecording {
     $pidFile = Join-Path $env:TEMP "screenrec_ffmpeg.pid"
     if (-not (Test-Path -LiteralPath $pidFile)) { return }
@@ -342,8 +406,9 @@ function Get-AllProcessIds {
     } catch {
         Warn "Get-AllProcessIds failed: $($_.Exception.Message)"
     }
-    # Comma keeps a one-element result an array.
-    return ,($ids.ToArray() | Sort-Object -Unique)
+    # Emit each ID. Callers collect with @(). A leading comma nests the whole
+    # list as one element, and [int[]] then fails to bind that Object[].
+    return @($ids.ToArray() | Sort-Object -Unique)
 }
 
 function Stop-IdsRobust {
@@ -476,6 +541,7 @@ function Stop-NewProcessesExceptRecording {
     param(
         [Parameter(Mandatory=$true)][int[]]$BaselinePids,
         [int]$RecordingPid = 0,
+        [int]$MitmPid = 0,
         [string]$AppName = ""
     )
 
@@ -490,6 +556,10 @@ function Stop-NewProcessesExceptRecording {
         $exclude.Add($RecordingPid)
         Write-Log "  Keeping recording process PID $RecordingPid"
     }
+    if ($MitmPid -gt 0) {
+        $exclude.Add($MitmPid)
+        Write-Log "  Keeping mitmdump process PID $MitmPid"
+    }
 
     $excludeArr = @($exclude | Sort-Object -Unique)
     Stop-NewProcesses -BaselinePids $BaselinePids -ExcludePids $excludeArr -AppName $AppName
@@ -503,7 +573,27 @@ function Stop-NewAppProcesses {
     }
     $recId = 0
     if ($script:RecordingPid) { $recId = [int]$script:RecordingPid }
-    Stop-NewProcessesExceptRecording -BaselinePids $script:BaselinePids -RecordingPid $recId -AppName $AppName
+    $mitmId = 0
+    if ($script:MitmProc -and -not $script:MitmProc.HasExited) {
+        $mitmId = [int]$script:MitmProc.Id
+    }
+    Stop-NewProcessesExceptRecording -BaselinePids $script:BaselinePids -RecordingPid $recId -MitmPid $mitmId -AppName $AppName
+}
+
+function Stop-MitmCapture {
+    if ($script:MitmStopped) { return }
+    $script:MitmStopped = $true
+    $proc = $script:MitmProc
+    if (-not $proc) { return }
+    Stop-Mitmdump -Process $proc
+    $script:MitmProc = $null
+    $dumpFile = $script:MitmDumpFile
+    if ($dumpFile -and (Test-Path -LiteralPath $dumpFile)) {
+        $dumpSize = (Get-Item -LiteralPath $dumpFile).Length
+        Write-Log "  Mitmdump stopped; output saved to $dumpFile (size: $dumpSize bytes)"
+    } elseif ($dumpFile) {
+        Warn "Mitmdump output file not found at $dumpFile"
+    }
 }
 
 function Stop-AppLeftoversThenRecording {
@@ -514,6 +604,7 @@ function Stop-AppLeftoversThenRecording {
         Stop-NewAppProcesses -AppName $AppName
         $script:LeftoversCleared = $true
     }
+    Stop-MitmCapture
     Stop-ScreenRecording
 }
 
@@ -540,6 +631,9 @@ if ($isAdmin) {
 # ================================================================
 $script:BaselinePids = @()
 $script:RecordingPid = $null
+$script:MitmProc = $null
+$script:MitmDumpFile = $null
+$script:MitmStopped = $false
 $script:LeftoversCleared = $false
 $label = ''
 
@@ -551,6 +645,9 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
     # Pre-ID: everything already running before this app, including before the recorder starts.
     $script:BaselinePids = @(Get-AllProcessIds)
     $script:RecordingPid = $null
+    $script:MitmProc = $null
+    $script:MitmDumpFile = $null
+    $script:MitmStopped = $false
     $script:LeftoversCleared = $false
 
     $helpersRecPath = Join-Path $parentDir "helpers\rec.py"
@@ -596,6 +693,36 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
       }
     }
     $script:RecordingPid = $recordingPid
+
+    $stem = ($label -replace '[^a-zA-Z0-9]', '_')
+    $dumpFile = Join-Path $netdumpDir "$stem.mitm"
+    $mitmLogPath = Join-Path $mitmLogDir "$stem.mitmdump.log"
+    $script:MitmDumpFile = $dumpFile
+    if (Test-Path -LiteralPath $mitmLogPath) {
+        Remove-Item -LiteralPath $mitmLogPath -Force -ErrorAction SilentlyContinue
+    }
+    try {
+        $script:MitmProc = Start-Mitmdump -OutFile $dumpFile -Mode local -IgnoreHosts @(
+            '(^|\.)generativelanguage\.googleapis\.com$', '(^|\.)gradio\.live$'
+        ) -LogFile $mitmLogPath
+        if ($script:MitmProc) {
+            Write-Log "  mitmdump PID $($script:MitmProc.Id) writing to $dumpFile"
+        } else {
+            Warn "mitmdump failed to start; no process object returned."
+        }
+        Start-Sleep -Milliseconds 500
+        if ($script:MitmProc -and $script:MitmProc.HasExited) {
+            $code = $script:MitmProc.ExitCode
+            Warn "mitmdump exited immediately with code $code"
+            if (Test-Path -LiteralPath $mitmLogPath) {
+                $tail = Get-Content -LiteralPath $mitmLogPath -Tail 20 -ErrorAction SilentlyContinue
+                foreach ($line in $tail) { Warn "mitmdump: $line" }
+            }
+        }
+    } catch {
+        Warn "mitmdump failed to start: $($_.Exception.Message)"
+        $script:MitmProc = $null
+    }
 
     Write-Log ""
     Write-Log "------------------------------------------------"
@@ -678,9 +805,9 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
 
     Write-Log $installLog
 
-    # -- STEP 2: UNINSTALL (only if NOT 'exist') --
-    if ($status -eq 'exist') {
-        Write-Log "  Skipping uninstall - app already existed."
+    # -- STEP 2: UNINSTALL (only if NOT 'exist' or 'failure') --
+    if ($status -eq 'exist' -or $status -eq 'failure') {
+        Write-Log "  Skipping uninstall - app already existed or installation failed."
         $totalSkipped++
         Stop-AppLeftoversThenRecording -AppName $label
         continue
@@ -789,8 +916,8 @@ Write-Log "================================================"
 Write-Log "SUMMARY"
 Write-Log "================================================"
 Write-Log "Total apps processed : $($apps.Count)"
-Write-Log "Install   - exist: $totalExist  success: $totalSuccess  failure: $totalFailure"
-Write-Log "Uninstall - success: $totalUninstallSuccess  failure: $totalUninstallFailure  skipped (exist): $totalSkipped"
+Write-Log "Install   - success: $totalSuccess exist: $totalExist    failure: $totalFailure"
+Write-Log "Uninstall - success: $totalUninstallSuccess  failure: $totalUninstallFailure  skipped: $totalSkipped"
 Write-Log "Uninstall methods:"
 foreach ($name in $uniMethodNames) {
     $n = $uniMethodTotal[$name]
