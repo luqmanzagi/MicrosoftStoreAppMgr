@@ -1,8 +1,10 @@
 # Invoke-TestPower.ps1
 # For each app in result/app_1.json:
 #   1. Install it  (same logic as scripts/install.ps1)
-#   2. Immediately uninstall it if it was NOT already installed ('exist')
+#   2. Stop processes that appeared since pre-ID (except the recorder), then
+#      uninstall if it was NOT already installed ('exist')
 #      using scripts/Remove-SingleApplication.ps1
+#   3. After uninstall, stop leftover new processes, then stop the recording.
 # Then move on to the next app.
 
 # -- Path setup --
@@ -11,7 +13,7 @@ if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
 $parentDir = Split-Path -Parent $scriptDir
 if (-not $parentDir) { $parentDir = (Get-Location).Path }
 
-$jsonPath          = Join-Path $parentDir 'results\app_test.json'
+$jsonPath          = Join-Path $parentDir 'results\app_2026-10-20.json'
 $uninstallScript   = Join-Path $scriptDir 'Remove-SingleApplication.new.ps1'
 
 # Validate required files
@@ -52,6 +54,10 @@ function Info($msg) {
         $script:LogFileStream.WriteLine($logMsg)
         $script:LogFileStream.Flush()
     }
+}
+
+function Warn($msg) {
+    Write-Log "[WARN ] $msg"
 }
 
 # -- Load apps from JSON --
@@ -323,6 +329,194 @@ function Stop-ScreenRecording {
     }
 }
 
+function Get-AllProcessIds {
+    <#
+      .SYNOPSIS
+        Returns all current process IDs as an array of integers.
+    #>
+    $ids = [System.Collections.Generic.List[int]]::new()
+    try {
+        foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
+            if ($p.Id -gt 0) { $ids.Add([int]$p.Id) }
+        }
+    } catch {
+        Warn "Get-AllProcessIds failed: $($_.Exception.Message)"
+    }
+    # Comma keeps a one-element result an array.
+    return ,($ids.ToArray() | Sort-Object -Unique)
+}
+
+function Stop-IdsRobust {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][object[]]$Ids,
+        [string]$AppName = "",
+        [string]$PsKillPath = "",
+        [switch]$Tree
+    )
+
+    $pidList = @()
+    foreach ($i in $Ids) {
+        if ($null -ne $i) {
+            $s = "$i".Trim()
+            if ($s -match '^\d+$') {
+                $v = [int]$s
+                if ($v -gt 0) { $pidList += $v }
+            }
+        }
+    }
+    $pidList = @($pidList | Sort-Object -Unique)
+
+    if ($pidList.Count -eq 0) {
+        Warn "No related PIDs found to terminate for '$AppName'."
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($PsKillPath)) {
+        $PsKillPath = Join-Path $parentDir "helpers\pskill64.exe"
+    }
+
+    try {
+        if (Test-Path -LiteralPath $PsKillPath) {
+            $killArgs = @()
+            if ($Tree.IsPresent) { $killArgs += '-t' }
+            $killArgs += $pidList | ForEach-Object { "$_" }
+
+            Write-Log "$([IO.Path]::GetFileName($PsKillPath)) $($killArgs -join ' ')"
+            $p = Start-Process -FilePath $PsKillPath -ArgumentList $killArgs -NoNewWindow -PassThru -Wait -ErrorAction Stop
+            if ($p.ExitCode -ne 0) {
+                Warn "pskill exited with code $($p.ExitCode). Falling back to Stop-Process."
+                foreach ($singlePid in $pidList) {
+                    try {
+                        Stop-Process -Id $singlePid -Force -ErrorAction Stop
+                        Write-Log "Stopped process Id $singlePid for '$AppName'."
+                    } catch { Warn "Stop-Process($singlePid): $($_.Exception.Message)" }
+                }
+            }
+        } else {
+            foreach ($singlePid in $pidList) {
+                try {
+                    Stop-Process -Id $singlePid -Force -ErrorAction Stop
+                    Write-Log "Stopped process Id $singlePid for '$AppName'."
+                } catch { Warn "Stop-Process($singlePid): $($_.Exception.Message)" }
+            }
+        }
+    } catch {
+        Warn "Stop-IdsRobust failed: $($_.Exception.Message)"
+    }
+}
+
+function Stop-NewProcesses {
+    <#
+      .SYNOPSIS
+        Stops processes that were created after a baseline snapshot.
+      .PARAMETER BaselinePids
+        Array of process IDs that existed before the operation.
+      .PARAMETER ExcludePids
+        Array of process IDs to exclude from termination (the screen recorder).
+      .PARAMETER AppName
+        Name of the app for logging purposes.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [int[]]$BaselinePids,
+        [int[]]$ExcludePids = @(),
+        [string]$AppName = ""
+    )
+
+    try {
+        $currentPids = @(Get-AllProcessIds)
+        $baselineSet = @{}
+        foreach ($id in @($BaselinePids)) { $baselineSet[[int]$id] = $true }
+
+        $newPids = @($currentPids | Where-Object { -not $baselineSet.ContainsKey([int]$_) })
+        Write-Log "  Post-ID count: $($currentPids.Count); new since pre-ID: $($newPids.Count)"
+
+        if ($ExcludePids.Count -gt 0) {
+            $excludeSet = @{}
+            foreach ($id in $ExcludePids) { $excludeSet[[int]$id] = $true }
+            $newPids = @($newPids | Where-Object { -not $excludeSet.ContainsKey([int]$_) })
+        }
+
+        # Our own host, the recorder, and the Python helper that starts it.
+        # rec.py copies ffmpeg to screenrec-recorder.exe so uninstallers that
+        # kill every ffmpeg.exe do not end the capture. That copy owns a
+        # console; killing its conhost closes the console end_rec.py attaches to.
+        $excludeNames = @{
+            'powershell' = $true; 'pwsh' = $true; 'python' = $true; 'pythonw' = $true
+            'mitmdump' = $true; 'ffmpeg' = $true; 'gdigrab' = $true
+            'screenrec-recorder' = $true; 'conhost' = $true
+        }
+        $finalPids = @()
+        foreach ($processId in $newPids) {
+            try {
+                $proc = Get-Process -Id $processId -ErrorAction SilentlyContinue
+                if ($proc -and -not $excludeNames.ContainsKey($proc.ProcessName.ToLower())) {
+                    $finalPids += $processId
+                }
+            } catch {
+                # Process may have already exited.
+            }
+        }
+
+        $finalPids = @($finalPids | Sort-Object -Unique)
+        if ($finalPids.Count -eq 0) {
+            Write-Log "  No new processes to terminate for '$AppName'."
+            return
+        }
+
+        Write-Log "  Terminating new process IDs for '$AppName': $($finalPids -join ', ')"
+        Stop-IdsRobust -Ids $finalPids -AppName $AppName
+    } catch {
+        Warn "Stop-NewProcesses failed: $($_.Exception.Message)"
+    }
+}
+
+function Stop-NewProcessesExceptRecording {
+    param(
+        [Parameter(Mandatory=$true)][int[]]$BaselinePids,
+        [int]$RecordingPid = 0,
+        [string]$AppName = ""
+    )
+
+    if (@($BaselinePids).Count -eq 0) {
+        Warn "No baseline process IDs; skipping termination for '$AppName'."
+        return
+    }
+
+    $exclude = [System.Collections.Generic.List[int]]::new()
+    $exclude.Add($PID)
+    if ($RecordingPid -gt 0) {
+        $exclude.Add($RecordingPid)
+        Write-Log "  Keeping recording process PID $RecordingPid"
+    }
+
+    $excludeArr = @($exclude | Sort-Object -Unique)
+    Stop-NewProcesses -BaselinePids $BaselinePids -ExcludePids $excludeArr -AppName $AppName
+}
+
+function Stop-NewAppProcesses {
+    param([string]$AppName = "")
+    if (@($script:BaselinePids).Count -eq 0) {
+        Warn "No baseline process IDs; skipping termination for '$AppName'."
+        return
+    }
+    $recId = 0
+    if ($script:RecordingPid) { $recId = [int]$script:RecordingPid }
+    Stop-NewProcessesExceptRecording -BaselinePids $script:BaselinePids -RecordingPid $recId -AppName $AppName
+}
+
+function Stop-AppLeftoversThenRecording {
+    param([string]$AppName = "")
+    # Always run leftover cleanup after uninstall. The outer finally also calls
+    # this; skip only that second pass after this app was already cleaned.
+    if (-not $script:LeftoversCleared) {
+        Stop-NewAppProcesses -AppName $AppName
+        $script:LeftoversCleared = $true
+    }
+    Stop-ScreenRecording
+}
+
 # UAC normally runs on the secure desktop, which screen capture cannot read:
 # gdigrab fails with "Failed to capture image (error 5)" and FFmpeg exits.
 # Show prompts on the normal desktop for this run, then restore the setting.
@@ -344,10 +538,20 @@ if ($isAdmin) {
 # ================================================================
 # MAIN LOOP - Install then Uninstall per app
 # ================================================================
+$script:BaselinePids = @()
+$script:RecordingPid = $null
+$script:LeftoversCleared = $false
+$label = ''
+
 try {
 for ($i = 0; $i -lt $apps.Count; $i++) {
     $app = $apps[$i]
     $label = if ($app.Name) { "$($app.Name) [$($app.ID)]" } else { $app.ID }
+
+    # Pre-ID: everything already running before this app, including before the recorder starts.
+    $script:BaselinePids = @(Get-AllProcessIds)
+    $script:RecordingPid = $null
+    $script:LeftoversCleared = $false
 
     $helpersRecPath = Join-Path $parentDir "helpers\rec.py"
     $recOutPath = Join-Path $recDir "$($label -replace '[^a-zA-Z0-9]', '_').mp4"
@@ -391,11 +595,13 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
         }
       }
     }
+    $script:RecordingPid = $recordingPid
 
     Write-Log ""
     Write-Log "------------------------------------------------"
     Write-Log "[$($i + 1)/$($apps.Count)] $label"
     Write-Log "------------------------------------------------"
+    Write-Log "  Pre-ID count: $(@($script:BaselinePids).Count)"
 
     # -- STEP 1: INSTALL (same approach as scripts/install.ps1) --
     Write-Host "  Installing..."
@@ -476,7 +682,7 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
     if ($status -eq 'exist') {
         Write-Log "  Skipping uninstall - app already existed."
         $totalSkipped++
-        Stop-ScreenRecording
+        Stop-AppLeftoversThenRecording -AppName $label
         continue
     }
 
@@ -488,7 +694,7 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
         Write-Log "  Skipping uninstall - no display name available for registry lookup."
         $totalUninstallFailure++
         Add-UninstallMethodCount -Method 'no display name' -Status 'failure'
-        Stop-ScreenRecording
+        Stop-AppLeftoversThenRecording -AppName $label
         continue
     }
 
@@ -496,6 +702,10 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
     $uniOutput = $null
     $uniExit   = 0
     $uiBefore  = Get-VisibleWindowMap
+
+    # Some apps refuse to uninstall while they are still running.
+    Write-Log "  Stopping new processes before uninstall."
+    Stop-NewAppProcesses -AppName $appName
 
     try {
         # *>&1 captures Write-Host (information stream) as well as success and error output.
@@ -562,11 +772,11 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
     Write-Log $uninstallLog
 
     Wait-UninstallUi -Before $uiBefore -AppName $appName -StartedAt $startTime
-    Stop-ScreenRecording
+    Stop-AppLeftoversThenRecording -AppName $label
 }
 }
 finally {
-    Stop-ScreenRecording
+    Stop-AppLeftoversThenRecording -AppName $label
     if ($isAdmin -and $null -ne $uacSecureDesktopOriginal -and $uacSecureDesktopOriginal -ne 0) {
         Set-ItemProperty -Path $uacKey -Name PromptOnSecureDesktop -Value $uacSecureDesktopOriginal -Type DWord
         Write-Log "UAC secure desktop setting restored."
