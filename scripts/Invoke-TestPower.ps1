@@ -5,8 +5,10 @@
 #   3. Stop new processes (except recorder and mitm), then uninstall
 #      if it was NOT already installed ('exist')
 #      using scripts/Remove-SingleApplication.ps1
-#   4. Wait until the uninstall window is gone
-#   5. Stop leftover processes, stop mitm, then stop recording
+#   4. While that runs, click Uninstall / Remove / Next on dialogs
+#      that normal winget leaves on screen
+#   5. Wait until the uninstall window is gone
+#   6. Stop leftover processes, stop mitm, then stop recording
 # Then move on to the next app.
 
 # -- Path setup --
@@ -318,6 +320,69 @@ function Wait-UninstallUi {
     Write-Log "  Timed out waiting for the uninstall window to close."
 }
 
+# Clicks Uninstall, Remove, Next, and the other progress buttons on wizard
+# dialogs while winget is blocked. pywinauto helper based on uni4.py.
+# A form selects Uninstall first. Runs as a separate process so the
+# uninstall script can stay synchronous.
+$script:UninstallUiProc = $null
+$uninstallUiScript = Join-Path $parentDir 'helpers\drive_uninstall_ui.py'
+
+function ConvertTo-ProcessArgList {
+    param([string[]]$Parts)
+    ($Parts | ForEach-Object {
+        $s = [string]$_
+        if ($s -notmatch '[\s"]') { return $s }
+        '"' + ($s -replace '\\', '\\' -replace '"', '\"') + '"'
+    }) -join ' '
+}
+
+function Start-UninstallDialogDriver {
+    param([string]$AppName)
+    Stop-UninstallDialogDriver
+    if (-not (Test-Path -LiteralPath $uninstallUiScript)) {
+        Warn "Uninstall UI helper not found: $uninstallUiScript"
+        return
+    }
+    $argString = ConvertTo-ProcessArgList @(
+        '-u'
+        $uninstallUiScript
+        '--watch'
+        '--app-name'
+        $AppName
+        '--log'
+        $logPath
+        '--ignore-pid'
+        "$PID"
+    )
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'python'
+        $psi.Arguments = $argString
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $script:UninstallUiProc = [System.Diagnostics.Process]::Start($psi)
+        Write-Log "  Watching for uninstall dialogs (pywinauto PID $($script:UninstallUiProc.Id))."
+    } catch {
+        Warn "Could not start uninstall dialog driver: $($_.Exception.Message)"
+    }
+}
+
+function Stop-UninstallDialogDriver {
+    $proc = $script:UninstallUiProc
+    $script:UninstallUiProc = $null
+    if (-not $proc) { return }
+    try { $proc.Refresh() } catch { }
+    try {
+        if ($proc.HasExited) { return }
+    } catch { }
+    try {
+        Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+        Write-Log "  Stopped uninstall dialog watcher."
+    } catch {
+        Warn "Could not stop uninstall dialog driver: $($_.Exception.Message)"
+    }
+}
+
 $mitmCA = "$env:USERPROFILE\.mitmproxy\mitmproxy-ca-cert.pem"
 $env:SSL_CERT_FILE = $mitmCA
 $env:REQUESTS_CA_BUNDLE = $mitmCA
@@ -360,6 +425,29 @@ function Start-Mitmdump {
     }
 
     Start-Process @startParams
+}
+
+function Wait-MitmdumpReady {
+    param(
+        $Process,
+        [string]$LogFile,
+        [int]$TimeoutSeconds = 20
+    )
+
+    # Start-Process returns before --mode local has attached WinDivert.
+    # Winget's Store request is aborted if that attach happens mid-request.
+    if (-not $Process) { return $false }
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        try { $Process.Refresh() } catch { }
+        if ($Process.HasExited) { return $false }
+        if ($LogFile -and (Test-Path -LiteralPath $LogFile)) {
+            $ready = Select-String -LiteralPath $LogFile -Pattern 'Local redirector started' -Quiet -ErrorAction SilentlyContinue
+            if ($ready) { return $true }
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    return $false
 }
 
 function Stop-Mitmdump {
@@ -710,7 +798,7 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
         } else {
             Warn "mitmdump failed to start; no process object returned."
         }
-        Start-Sleep -Milliseconds 500
+        $mitmReady = Wait-MitmdumpReady -Process $script:MitmProc -LogFile $mitmLogPath
         if ($script:MitmProc -and $script:MitmProc.HasExited) {
             $code = $script:MitmProc.ExitCode
             Warn "mitmdump exited immediately with code $code"
@@ -718,6 +806,10 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
                 $tail = Get-Content -LiteralPath $mitmLogPath -Tail 20 -ErrorAction SilentlyContinue
                 foreach ($line in $tail) { Warn "mitmdump: $line" }
             }
+        } elseif ($script:MitmProc -and -not $mitmReady) {
+            Warn "mitmdump local redirector was not ready after 20s. Store install may be aborted."
+        } elseif ($mitmReady) {
+            Write-Log "  mitmdump local redirector is ready."
         }
     } catch {
         Warn "mitmdump failed to start: $($_.Exception.Message)"
@@ -729,6 +821,9 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
     Write-Log "[$($i + 1)/$($apps.Count)] $label"
     Write-Log "------------------------------------------------"
     Write-Log "  Pre-ID count: $(@($script:BaselinePids).Count)"
+
+    Start-UninstallDialogDriver -AppName $(if ($app.Name) { $app.Name } else { $label })
+    try {
 
     # -- STEP 1: INSTALL (same approach as scripts/install.ps1) --
     Write-Host "  Installing..."
@@ -899,10 +994,14 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
     Write-Log $uninstallLog
 
     Wait-UninstallUi -Before $uiBefore -AppName $appName -StartedAt $startTime
+    } finally {
+        Stop-UninstallDialogDriver
+    }
     Stop-AppLeftoversThenRecording -AppName $label
 }
 }
 finally {
+    Stop-UninstallDialogDriver
     Stop-AppLeftoversThenRecording -AppName $label
     if ($isAdmin -and $null -ne $uacSecureDesktopOriginal -and $uacSecureDesktopOriginal -ne 0) {
         Set-ItemProperty -Path $uacKey -Name PromptOnSecureDesktop -Value $uacSecureDesktopOriginal -Type DWord
