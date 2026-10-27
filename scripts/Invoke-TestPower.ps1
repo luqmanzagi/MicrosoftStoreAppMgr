@@ -701,9 +701,12 @@ function Stop-AppLeftoversThenRecording {
 # Show prompts on the normal desktop for this run, then restore the setting.
 $uacKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
 $uacSecureDesktopOriginal = $null
+$uacConsentPromptAdminOriginal = $null
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($isAdmin) {
+    $uacConsentPromptAdminOriginal = (Get-ItemProperty -Path $uacKey -Name ConsentPromptBehaviorAdmin -ErrorAction SilentlyContinue).ConsentPromptBehaviorAdmin
+    if ($null -eq $uacConsentPromptAdminOriginal) { $uacConsentPromptAdminOriginal = 5 }
     $uacSecureDesktopOriginal = (Get-ItemProperty -Path $uacKey -Name PromptOnSecureDesktop -ErrorAction SilentlyContinue).PromptOnSecureDesktop
     if ($null -eq $uacSecureDesktopOriginal) { $uacSecureDesktopOriginal = 1 }
     if ($uacSecureDesktopOriginal -ne 0) {
@@ -713,6 +716,8 @@ if ($isAdmin) {
 } else {
     Write-Log "WARNING: not running as administrator; UAC prompts stay on the secure desktop and will stop the recording."
 }
+winget settings --enable BypassCertificatePinningForMicrosoftStore
+Write-Log "BypassCertificatePinningForMicrosoftStore enabled."
 
 # ================================================================
 # MAIN LOOP - Install then Uninstall per app
@@ -929,6 +934,11 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
     Write-Log "  Stopping new processes before uninstall."
     Stop-NewAppProcesses -AppName $appName
 
+    if ($isAdmin -and $null -ne $uacConsentPromptAdminOriginal -and $uacConsentPromptAdminOriginal -ne 0) {
+        Set-ItemProperty -Path $uacKey -Name ConsentPromptBehaviorAdmin -Value 0 -Type DWord
+        Write-Log "UAC Consent Prompt Behavior Admin will be restored at the end."
+    }
+
     try {
         # *>&1 captures Write-Host (information stream) as well as success and error output.
         $uniOutput = & $uninstallScript -ApplicationName $appName -Id $app.ID *>&1
@@ -1007,6 +1017,10 @@ finally {
         Set-ItemProperty -Path $uacKey -Name PromptOnSecureDesktop -Value $uacSecureDesktopOriginal -Type DWord
         Write-Log "UAC secure desktop setting restored."
     }
+    if ($isAdmin -and $null -ne $uacConsentPromptAdminOriginal -and $uacConsentPromptAdminOriginal -ne 0) {
+        Set-ItemProperty -Path $uacKey -Name ConsentPromptBehaviorAdmin -Value $uacConsentPromptAdminOriginal -Type DWord
+        Write-Log "UAC consent prompt behavior admin setting restored."
+    }
 }
 
 # -- Summary --
@@ -1025,4 +1039,7 @@ foreach ($name in $uniMethodNames) {
 }
 Write-Log "=== Invoke-TestPower finished: $(Get-Date) ==="
 Write-Host ""
+winget settings --disable BypassCertificatePinningForMicrosoftStore
+Write-Log "BypassCertificatePinningForMicrosoftStore disabled."
 Write-Host "Log saved to: $logPath"
+
