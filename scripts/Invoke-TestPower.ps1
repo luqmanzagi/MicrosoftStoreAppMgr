@@ -1,6 +1,6 @@
 # Invoke-TestPower.ps1
 # For each app in result/app_1.json:
-#   1. Snapshot pre-ID, start recording, start mitm
+#   1. Snapshot pre-ID, start recording, start mitm, start network stack trace
 #   2. Install it  (same logic as scripts/install.ps1)
 #   3. Stop new processes (except recorder and mitm), then uninstall
 #      if it was NOT already installed ('exist')
@@ -8,7 +8,7 @@
 #   4. While that runs, click Uninstall / Remove / Next on dialogs
 #      that normal winget leaves on screen
 #   5. Wait until the uninstall window is gone
-#   6. Stop leftover processes, stop mitm, then stop recording
+#   6. Stop leftover processes, stop network stack trace, stop mitm, then stop recording
 # Then move on to the next app.
 
 # -- Path setup --
@@ -41,10 +41,20 @@ if (-not (Test-Path -LiteralPath $netdumpDir)) {
     New-Item -ItemType Directory -Path $netdumpDir -Force | Out-Null
 }
 
+$etlDir = Join-Path $parentDir 'results\logs\etl'
+if (-not (Test-Path -LiteralPath $etlDir)) {
+    New-Item -ItemType Directory -Path $etlDir -Force | Out-Null
+}
+
 $mitmLogDir = Join-Path $parentDir 'results\logs\mitmdump'
 if (-not (Test-Path -LiteralPath $mitmLogDir)) {
     New-Item -ItemType Directory -Path $mitmLogDir -Force | Out-Null
 }
+
+# wpr writes temporary trace files here. The finished .etl is saved next to the .mitm.
+$networkStackTempDir = Join-Path $parentDir 'results\logs\network-stacks'
+$startNetworkStackTrace = Join-Path $scriptDir 'Start-NetworkStackTrace.ps1'
+$stopNetworkStackTrace = Join-Path $scriptDir 'Stop-NetworkStackTrace.ps1'
 
 # -- Logging --
 $logDir = Join-Path $parentDir 'results\logs\terminal'
@@ -399,7 +409,9 @@ function Start-Mitmdump {
         throw "mitmdump not found on PATH."
     }
 
-    $mitmArgs = @("--mode", $Mode, "-w", $OutFile)
+    # Windows Update (*.update.microsoft.com) is signed by Microsoft ECC Update
+    # Secure Server CA 2.1, which Windows trusts and mitmproxy's CA bundle does not.
+    $mitmArgs = @("--mode", $Mode, "--ssl-insecure", "-w", $OutFile)
     foreach ($pat in $IgnoreHosts) {
         $mitmArgs += @("--ignore-hosts", $pat)
     }
@@ -595,10 +607,11 @@ function Stop-NewProcesses {
         # rec.py copies ffmpeg to screenrec-recorder.exe so uninstallers that
         # kill every ffmpeg.exe do not end the capture. That copy owns a
         # console; killing its conhost closes the console end_rec.py attaches to.
+        # wpr.exe is the network stack trace; killing it drops the ETL.
         $excludeNames = @{
             'powershell' = $true; 'pwsh' = $true; 'python' = $true; 'pythonw' = $true
             'mitmdump' = $true; 'ffmpeg' = $true; 'gdigrab' = $true
-            'screenrec-recorder' = $true; 'conhost' = $true
+            'screenrec-recorder' = $true; 'conhost' = $true; 'wpr' = $true
         }
         $finalPids = @()
         foreach ($processId in $newPids) {
@@ -684,6 +697,61 @@ function Stop-MitmCapture {
     }
 }
 
+function Start-NetworkStackCapture {
+    param(
+        [Parameter(Mandatory=$true)][string]$TempDirectory,
+        [Parameter(Mandatory=$true)][string]$EtlFile
+    )
+
+    if (-not (Test-Path -LiteralPath $startNetworkStackTrace)) {
+        Warn "Start-NetworkStackTrace.ps1 not found: $startNetworkStackTrace"
+        return
+    }
+
+    try {
+        & $startNetworkStackTrace -OutputDirectory $TempDirectory
+        $script:NetworkStackEtl = $EtlFile
+        $script:NetworkStackStarted = $true
+        Write-Log "  Network stack trace recording; will write $EtlFile"
+    } catch {
+        $script:NetworkStackStarted = $false
+        $script:NetworkStackEtl = $null
+        Warn "Network stack trace failed to start: $($_.Exception.Message)"
+    }
+}
+
+function Stop-NetworkStackCapture {
+    if (-not $script:NetworkStackStarted) { return }
+    $script:NetworkStackStarted = $false
+    $etlFile = $script:NetworkStackEtl
+    $script:NetworkStackEtl = $null
+
+    if (-not (Test-Path -LiteralPath $stopNetworkStackTrace)) {
+        Warn "Stop-NetworkStackTrace.ps1 not found: $stopNetworkStackTrace"
+        return
+    }
+
+    try {
+        # wpr -stop refuses to replace an existing file. -Force only skips the script's own check.
+        if ($etlFile -and (Test-Path -LiteralPath $etlFile)) {
+            Remove-Item -LiteralPath $etlFile -Force
+        }
+        if ($etlFile) {
+            & $stopNetworkStackTrace -OutputFile $etlFile -Force
+        } else {
+            & $stopNetworkStackTrace -Force
+        }
+        if ($etlFile -and (Test-Path -LiteralPath $etlFile)) {
+            $etlSize = (Get-Item -LiteralPath $etlFile).Length
+            Write-Log "  Network stack trace stopped; output saved to $etlFile (size: $etlSize bytes)"
+        } elseif ($etlFile) {
+            Warn "Network stack trace output file not found at $etlFile"
+        }
+    } catch {
+        Warn "Network stack trace failed to stop: $($_.Exception.Message)"
+    }
+}
+
 function Stop-AppLeftoversThenRecording {
     param([string]$AppName = "")
     # Always run leftover cleanup after uninstall. The outer finally also calls
@@ -692,6 +760,7 @@ function Stop-AppLeftoversThenRecording {
         Stop-NewAppProcesses -AppName $AppName
         $script:LeftoversCleared = $true
     }
+    Stop-NetworkStackCapture
     Stop-MitmCapture
     Stop-ScreenRecording
 }
@@ -727,6 +796,8 @@ $script:RecordingPid = $null
 $script:MitmProc = $null
 $script:MitmDumpFile = $null
 $script:MitmStopped = $false
+$script:NetworkStackStarted = $false
+$script:NetworkStackEtl = $null
 $script:LeftoversCleared = $false
 $label = ''
 
@@ -741,6 +812,8 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
     $script:MitmProc = $null
     $script:MitmDumpFile = $null
     $script:MitmStopped = $false
+    $script:NetworkStackStarted = $false
+    $script:NetworkStackEtl = $null
     $script:LeftoversCleared = $false
 
     $helpersRecPath = Join-Path $parentDir "helpers\rec.py"
@@ -789,6 +862,7 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
 
     $stem = ($label -replace '[^a-zA-Z0-9]', '_')
     $dumpFile = Join-Path $netdumpDir "$stem.mitm"
+    $etlFile = Join-Path $etlDir "$stem.etl"
     $mitmLogPath = Join-Path $mitmLogDir "$stem.mitmdump.log"
     $script:MitmDumpFile = $dumpFile
     if (Test-Path -LiteralPath $mitmLogPath) {
@@ -815,6 +889,10 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
             Warn "mitmdump local redirector was not ready after 20s. Store install may be aborted."
         } elseif ($mitmReady) {
             Write-Log "  mitmdump local redirector is ready."
+        }
+        if ($script:MitmProc -and -not $script:MitmProc.HasExited) {
+            $stackTemp = Join-Path $networkStackTempDir $stem
+            Start-NetworkStackCapture -TempDirectory $stackTemp -EtlFile $etlFile
         }
     } catch {
         Warn "mitmdump failed to start: $($_.Exception.Message)"
