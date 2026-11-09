@@ -1,8 +1,14 @@
 # Invoke-TestPower.ps1
 # For each app in result/app_1.json:
-#   1. Install it  (same logic as scripts/install.ps1)
-#   2. Immediately uninstall it if it was NOT already installed ('exist')
+#   1. Snapshot pre-ID, start recording, start mitm, start network stack trace
+#   2. Install it  (same logic as scripts/install.ps1)
+#   3. Stop new processes (except recorder and mitm), then uninstall
+#      if it was NOT already installed ('exist')
 #      using scripts/Remove-SingleApplication.ps1
+#   4. While that runs, click Uninstall / Remove / Next on dialogs
+#      that normal winget leaves on screen
+#   5. Wait until the uninstall window is gone
+#   6. Stop leftover processes, stop network stack trace, stop mitm, then stop recording
 # Then move on to the next app.
 
 # -- Path setup --
@@ -30,8 +36,28 @@ if (-not (Test-Path -LiteralPath $recDir)) {
     New-Item -ItemType Directory -Path $recDir -Force | Out-Null
 }
 
+$netdumpDir = Join-Path $parentDir 'results\netdump'
+if (-not (Test-Path -LiteralPath $netdumpDir)) {
+    New-Item -ItemType Directory -Path $netdumpDir -Force | Out-Null
+}
+
+$etlDir = Join-Path $parentDir 'results\logs\etl'
+if (-not (Test-Path -LiteralPath $etlDir)) {
+    New-Item -ItemType Directory -Path $etlDir -Force | Out-Null
+}
+
+$mitmLogDir = Join-Path $parentDir 'results\logs\mitmdump'
+if (-not (Test-Path -LiteralPath $mitmLogDir)) {
+    New-Item -ItemType Directory -Path $mitmLogDir -Force | Out-Null
+}
+
+# wpr writes temporary trace files here. The finished .etl is saved next to the .mitm.
+$networkStackTempDir = Join-Path $parentDir 'results\logs\network-stacks'
+$startNetworkStackTrace = Join-Path $scriptDir 'Start-NetworkStackTrace.ps1'
+$stopNetworkStackTrace = Join-Path $scriptDir 'Stop-NetworkStackTrace.ps1'
+
 # -- Logging --
-$logDir = Join-Path $parentDir 'logs\test'
+$logDir = Join-Path $parentDir 'results\logs\terminal'
 if (-not (Test-Path $logDir)) {
     New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 }
@@ -52,6 +78,10 @@ function Info($msg) {
         $script:LogFileStream.WriteLine($logMsg)
         $script:LogFileStream.Flush()
     }
+}
+
+function Warn($msg) {
+    Write-Log "[WARN ] $msg" -ForegroundColor Yellow
 }
 
 # -- Load apps from JSON --
@@ -300,6 +330,146 @@ function Wait-UninstallUi {
     Write-Log "  Timed out waiting for the uninstall window to close."
 }
 
+# Clicks Uninstall, Remove, Next, and the other progress buttons on wizard
+# dialogs while winget is blocked. pywinauto helper based on uni4.py.
+# A form selects Uninstall first. Runs as a separate process so the
+# uninstall script can stay synchronous.
+$script:UninstallUiProc = $null
+$uninstallUiScript = Join-Path $parentDir 'helpers\drive_uninstall_ui.py'
+
+function ConvertTo-ProcessArgList {
+    param([string[]]$Parts)
+    ($Parts | ForEach-Object {
+        $s = [string]$_
+        if ($s -notmatch '[\s"]') { return $s }
+        '"' + ($s -replace '\\', '\\' -replace '"', '\"') + '"'
+    }) -join ' '
+}
+
+function Start-UninstallDialogDriver {
+    param([string]$AppName)
+    Stop-UninstallDialogDriver
+    if (-not (Test-Path -LiteralPath $uninstallUiScript)) {
+        Warn "Uninstall UI helper not found: $uninstallUiScript"
+        return
+    }
+    $argString = ConvertTo-ProcessArgList @(
+        '-u'
+        $uninstallUiScript
+        '--watch'
+        '--app-name'
+        $AppName
+        '--log'
+        $logPath
+        '--ignore-pid'
+        "$PID"
+    )
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'python'
+        $psi.Arguments = $argString
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $script:UninstallUiProc = [System.Diagnostics.Process]::Start($psi)
+        Write-Log "  Watching for uninstall dialogs (pywinauto PID $($script:UninstallUiProc.Id))."
+    } catch {
+        Warn "Could not start uninstall dialog driver: $($_.Exception.Message)"
+    }
+}
+
+function Stop-UninstallDialogDriver {
+    $proc = $script:UninstallUiProc
+    $script:UninstallUiProc = $null
+    if (-not $proc) { return }
+    try { $proc.Refresh() } catch { }
+    try {
+        if ($proc.HasExited) { return }
+    } catch { }
+    try {
+        Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+        Write-Log "  Stopped uninstall dialog watcher."
+    } catch {
+        Warn "Could not stop uninstall dialog driver: $($_.Exception.Message)"
+    }
+}
+
+$mitmCA = "$env:USERPROFILE\.mitmproxy\mitmproxy-ca-cert.pem"
+$env:SSL_CERT_FILE = $mitmCA
+$env:REQUESTS_CA_BUNDLE = $mitmCA
+
+function Start-Mitmdump {
+    param(
+        [string]$OutFile,
+        [string]$Mode = "local",
+        [string[]]$IgnoreHosts = @(),
+        [string]$LogFile = ""
+    )
+
+    if (-not (Get-Command mitmdump -ErrorAction SilentlyContinue)) {
+        throw "mitmdump not found on PATH."
+    }
+
+    # Windows Update (*.update.microsoft.com) is signed by Microsoft ECC Update
+    # Secure Server CA 2.1, which Windows trusts and mitmproxy's CA bundle does not.
+    $mitmArgs = @("--mode", $Mode, "--ssl-insecure", "-w", $OutFile)
+    foreach ($pat in $IgnoreHosts) {
+        $mitmArgs += @("--ignore-hosts", $pat)
+    }
+
+    $quotedArgs = $mitmArgs | ForEach-Object {
+        if ($_ -match '\s') { '"' + ($_ -replace '"','""') + '"' } else { $_ }
+    }
+    $argString = $quotedArgs -join ' '
+
+    Write-Log "  Start-Process mitmdump $argString"
+
+    $startParams = @{
+        FilePath     = "mitmdump"
+        ArgumentList = $argString
+        WindowStyle  = 'Hidden'
+        PassThru     = $true
+    }
+
+    if ($LogFile) {
+        $errPath = [IO.Path]::ChangeExtension($LogFile, ".err.log")
+        $startParams.RedirectStandardError  = $errPath
+        $startParams.RedirectStandardOutput = $LogFile
+    }
+
+    Start-Process @startParams
+}
+
+function Wait-MitmdumpReady {
+    param(
+        $Process,
+        [string]$LogFile,
+        [int]$TimeoutSeconds = 20
+    )
+
+    # Start-Process returns before --mode local has attached WinDivert.
+    # Winget's Store request is aborted if that attach happens mid-request.
+    if (-not $Process) { return $false }
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        try { $Process.Refresh() } catch { }
+        if ($Process.HasExited) { return $false }
+        if ($LogFile -and (Test-Path -LiteralPath $LogFile)) {
+            $ready = Select-String -LiteralPath $LogFile -Pattern 'Local redirector started' -Quiet -ErrorAction SilentlyContinue
+            if ($ready) { return $true }
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    return $false
+}
+
+function Stop-Mitmdump {
+    param($Process)
+    if ($Process -and -not $Process.HasExited) {
+        Stop-Process -Id $Process.Id -Force
+        Start-Sleep -Milliseconds 250
+    }
+}
+
 function Stop-ScreenRecording {
     $pidFile = Join-Path $env:TEMP "screenrec_ffmpeg.pid"
     if (-not (Test-Path -LiteralPath $pidFile)) { return }
@@ -323,14 +493,289 @@ function Stop-ScreenRecording {
     }
 }
 
+function Get-AllProcessIds {
+    <#
+      .SYNOPSIS
+        Returns all current process IDs as an array of integers.
+    #>
+    $ids = [System.Collections.Generic.List[int]]::new()
+    try {
+        foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
+            if ($p.Id -gt 0) { $ids.Add([int]$p.Id) }
+        }
+    } catch {
+        Warn "Get-AllProcessIds failed: $($_.Exception.Message)"
+    }
+    # Emit each ID. Callers collect with @(). A leading comma nests the whole
+    # list as one element, and [int[]] then fails to bind that Object[].
+    return @($ids.ToArray() | Sort-Object -Unique)
+}
+
+function Stop-IdsRobust {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][object[]]$Ids,
+        [string]$AppName = "",
+        [string]$PsKillPath = "",
+        [switch]$Tree
+    )
+
+    $pidList = @()
+    foreach ($i in $Ids) {
+        if ($null -ne $i) {
+            $s = "$i".Trim()
+            if ($s -match '^\d+$') {
+                $v = [int]$s
+                if ($v -gt 0) { $pidList += $v }
+            }
+        }
+    }
+    $pidList = @($pidList | Sort-Object -Unique)
+
+    if ($pidList.Count -eq 0) {
+        Warn "No related PIDs found to terminate for '$AppName'."
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($PsKillPath)) {
+        $PsKillPath = Join-Path $parentDir "helpers\pskill64.exe"
+    }
+
+    try {
+        if (Test-Path -LiteralPath $PsKillPath) {
+            $killArgs = @()
+            if ($Tree.IsPresent) { $killArgs += '-t' }
+            $killArgs += $pidList | ForEach-Object { "$_" }
+
+            Write-Log "$([IO.Path]::GetFileName($PsKillPath)) $($killArgs -join ' ')"
+            $p = Start-Process -FilePath $PsKillPath -ArgumentList $killArgs -NoNewWindow -PassThru -Wait -ErrorAction Stop
+            if ($p.ExitCode -ne 0) {
+                Warn "pskill exited with code $($p.ExitCode). Falling back to Stop-Process."
+                foreach ($singlePid in $pidList) {
+                    try {
+                        Stop-Process -Id $singlePid -Force -ErrorAction Stop
+                        Write-Log "Stopped process Id $singlePid for '$AppName'."
+                    } catch { Warn "Stop-Process($singlePid): $($_.Exception.Message)" }
+                }
+            }
+        } else {
+            foreach ($singlePid in $pidList) {
+                try {
+                    Stop-Process -Id $singlePid -Force -ErrorAction Stop
+                    Write-Log "Stopped process Id $singlePid for '$AppName'."
+                } catch { Warn "Stop-Process($singlePid): $($_.Exception.Message)" }
+            }
+        }
+    } catch {
+        Warn "Stop-IdsRobust failed: $($_.Exception.Message)"
+    }
+}
+
+function Stop-NewProcesses {
+    <#
+      .SYNOPSIS
+        Stops processes that were created after a baseline snapshot.
+      .PARAMETER BaselinePids
+        Array of process IDs that existed before the operation.
+      .PARAMETER ExcludePids
+        Array of process IDs to exclude from termination (the screen recorder).
+      .PARAMETER AppName
+        Name of the app for logging purposes.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [int[]]$BaselinePids,
+        [int[]]$ExcludePids = @(),
+        [string]$AppName = ""
+    )
+
+    try {
+        $currentPids = @(Get-AllProcessIds)
+        $baselineSet = @{}
+        foreach ($id in @($BaselinePids)) { $baselineSet[[int]$id] = $true }
+
+        $newPids = @($currentPids | Where-Object { -not $baselineSet.ContainsKey([int]$_) })
+        Write-Log "  Post-ID count: $($currentPids.Count); new since pre-ID: $($newPids.Count)"
+
+        if ($ExcludePids.Count -gt 0) {
+            $excludeSet = @{}
+            foreach ($id in $ExcludePids) { $excludeSet[[int]$id] = $true }
+            $newPids = @($newPids | Where-Object { -not $excludeSet.ContainsKey([int]$_) })
+        }
+
+        # Our own host, the recorder, and the Python helper that starts it.
+        # rec.py copies ffmpeg to screenrec-recorder.exe so uninstallers that
+        # kill every ffmpeg.exe do not end the capture. That copy owns a
+        # console; killing its conhost closes the console end_rec.py attaches to.
+        # wpr.exe is the network stack trace; killing it drops the ETL.
+        $excludeNames = @{
+            'powershell' = $true; 'pwsh' = $true; 'python' = $true; 'pythonw' = $true
+            'mitmdump' = $true; 'ffmpeg' = $true; 'gdigrab' = $true
+            'screenrec-recorder' = $true; 'conhost' = $true; 'wpr' = $true
+        }
+        $finalPids = @()
+        foreach ($processId in $newPids) {
+            try {
+                $proc = Get-Process -Id $processId -ErrorAction SilentlyContinue
+                if ($proc -and -not $excludeNames.ContainsKey($proc.ProcessName.ToLower())) {
+                    $finalPids += $processId
+                }
+            } catch {
+                # Process may have already exited.
+            }
+        }
+
+        $finalPids = @($finalPids | Sort-Object -Unique)
+        if ($finalPids.Count -eq 0) {
+            Write-Log "  No new processes to terminate for '$AppName'."
+            return
+        }
+
+        Write-Log "  Terminating new process IDs for '$AppName': $($finalPids -join ', ')"
+        Stop-IdsRobust -Ids $finalPids -AppName $AppName
+    } catch {
+        Warn "Stop-NewProcesses failed: $($_.Exception.Message)"
+    }
+}
+
+function Stop-NewProcessesExceptRecording {
+    param(
+        [Parameter(Mandatory=$true)][int[]]$BaselinePids,
+        [int]$RecordingPid = 0,
+        [int]$MitmPid = 0,
+        [string]$AppName = ""
+    )
+
+    if (@($BaselinePids).Count -eq 0) {
+        Warn "No baseline process IDs; skipping termination for '$AppName'."
+        return
+    }
+
+    $exclude = [System.Collections.Generic.List[int]]::new()
+    $exclude.Add($PID)
+    if ($RecordingPid -gt 0) {
+        $exclude.Add($RecordingPid)
+        Write-Log "  Keeping recording process PID $RecordingPid"
+    }
+    if ($MitmPid -gt 0) {
+        $exclude.Add($MitmPid)
+        Write-Log "  Keeping mitmdump process PID $MitmPid"
+    }
+
+    $excludeArr = @($exclude | Sort-Object -Unique)
+    Stop-NewProcesses -BaselinePids $BaselinePids -ExcludePids $excludeArr -AppName $AppName
+}
+
+function Stop-NewAppProcesses {
+    param([string]$AppName = "")
+    if (@($script:BaselinePids).Count -eq 0) {
+        Warn "No baseline process IDs; skipping termination for '$AppName'."
+        return
+    }
+    $recId = 0
+    if ($script:RecordingPid) { $recId = [int]$script:RecordingPid }
+    $mitmId = 0
+    if ($script:MitmProc -and -not $script:MitmProc.HasExited) {
+        $mitmId = [int]$script:MitmProc.Id
+    }
+    Stop-NewProcessesExceptRecording -BaselinePids $script:BaselinePids -RecordingPid $recId -MitmPid $mitmId -AppName $AppName
+}
+
+function Stop-MitmCapture {
+    if ($script:MitmStopped) { return }
+    $script:MitmStopped = $true
+    $proc = $script:MitmProc
+    if (-not $proc) { return }
+    Stop-Mitmdump -Process $proc
+    $script:MitmProc = $null
+    $dumpFile = $script:MitmDumpFile
+    if ($dumpFile -and (Test-Path -LiteralPath $dumpFile)) {
+        $dumpSize = (Get-Item -LiteralPath $dumpFile).Length
+        Write-Log "  Mitmdump stopped; output saved to $dumpFile (size: $dumpSize bytes)"
+    } elseif ($dumpFile) {
+        Warn "Mitmdump output file not found at $dumpFile"
+    }
+}
+
+function Start-NetworkStackCapture {
+    param(
+        [Parameter(Mandatory=$true)][string]$TempDirectory,
+        [Parameter(Mandatory=$true)][string]$EtlFile
+    )
+
+    if (-not (Test-Path -LiteralPath $startNetworkStackTrace)) {
+        Warn "Start-NetworkStackTrace.ps1 not found: $startNetworkStackTrace"
+        return
+    }
+
+    try {
+        & $startNetworkStackTrace -OutputDirectory $TempDirectory
+        $script:NetworkStackEtl = $EtlFile
+        $script:NetworkStackStarted = $true
+        Write-Log "  Network stack trace recording; will write $EtlFile"
+    } catch {
+        $script:NetworkStackStarted = $false
+        $script:NetworkStackEtl = $null
+        Warn "Network stack trace failed to start: $($_.Exception.Message)"
+    }
+}
+
+function Stop-NetworkStackCapture {
+    if (-not $script:NetworkStackStarted) { return }
+    $script:NetworkStackStarted = $false
+    $etlFile = $script:NetworkStackEtl
+    $script:NetworkStackEtl = $null
+
+    if (-not (Test-Path -LiteralPath $stopNetworkStackTrace)) {
+        Warn "Stop-NetworkStackTrace.ps1 not found: $stopNetworkStackTrace"
+        return
+    }
+
+    try {
+        # wpr -stop refuses to replace an existing file. -Force only skips the script's own check.
+        if ($etlFile -and (Test-Path -LiteralPath $etlFile)) {
+            Remove-Item -LiteralPath $etlFile -Force
+        }
+        if ($etlFile) {
+            & $stopNetworkStackTrace -OutputFile $etlFile -Force
+        } else {
+            & $stopNetworkStackTrace -Force
+        }
+        if ($etlFile -and (Test-Path -LiteralPath $etlFile)) {
+            $etlSize = (Get-Item -LiteralPath $etlFile).Length
+            Write-Log "  Network stack trace stopped; output saved to $etlFile (size: $etlSize bytes)"
+        } elseif ($etlFile) {
+            Warn "Network stack trace output file not found at $etlFile"
+        }
+    } catch {
+        Warn "Network stack trace failed to stop: $($_.Exception.Message)"
+    }
+}
+
+function Stop-AppLeftoversThenRecording {
+    param([string]$AppName = "")
+    # Always run leftover cleanup after uninstall. The outer finally also calls
+    # this; skip only that second pass after this app was already cleaned.
+    if (-not $script:LeftoversCleared) {
+        Stop-NewAppProcesses -AppName $AppName
+        $script:LeftoversCleared = $true
+    }
+    Stop-NetworkStackCapture
+    Stop-MitmCapture
+    Stop-ScreenRecording
+}
+
 # UAC normally runs on the secure desktop, which screen capture cannot read:
 # gdigrab fails with "Failed to capture image (error 5)" and FFmpeg exits.
 # Show prompts on the normal desktop for this run, then restore the setting.
 $uacKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
 $uacSecureDesktopOriginal = $null
+$uacConsentPromptAdminOriginal = $null
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($isAdmin) {
+    $uacConsentPromptAdminOriginal = (Get-ItemProperty -Path $uacKey -Name ConsentPromptBehaviorAdmin -ErrorAction SilentlyContinue).ConsentPromptBehaviorAdmin
+    if ($null -eq $uacConsentPromptAdminOriginal) { $uacConsentPromptAdminOriginal = 5 }
     $uacSecureDesktopOriginal = (Get-ItemProperty -Path $uacKey -Name PromptOnSecureDesktop -ErrorAction SilentlyContinue).PromptOnSecureDesktop
     if ($null -eq $uacSecureDesktopOriginal) { $uacSecureDesktopOriginal = 1 }
     if ($uacSecureDesktopOriginal -ne 0) {
@@ -340,14 +785,36 @@ if ($isAdmin) {
 } else {
     Write-Log "WARNING: not running as administrator; UAC prompts stay on the secure desktop and will stop the recording."
 }
+winget settings --enable BypassCertificatePinningForMicrosoftStore
+Write-Log "BypassCertificatePinningForMicrosoftStore enabled."
 
 # ================================================================
 # MAIN LOOP - Install then Uninstall per app
 # ================================================================
+$script:BaselinePids = @()
+$script:RecordingPid = $null
+$script:MitmProc = $null
+$script:MitmDumpFile = $null
+$script:MitmStopped = $false
+$script:NetworkStackStarted = $false
+$script:NetworkStackEtl = $null
+$script:LeftoversCleared = $false
+$label = ''
+
 try {
 for ($i = 0; $i -lt $apps.Count; $i++) {
     $app = $apps[$i]
     $label = if ($app.Name) { "$($app.Name) [$($app.ID)]" } else { $app.ID }
+
+    # Pre-ID: everything already running before this app, including before the recorder starts.
+    $script:BaselinePids = @(Get-AllProcessIds)
+    $script:RecordingPid = $null
+    $script:MitmProc = $null
+    $script:MitmDumpFile = $null
+    $script:MitmStopped = $false
+    $script:NetworkStackStarted = $false
+    $script:NetworkStackEtl = $null
+    $script:LeftoversCleared = $false
 
     $helpersRecPath = Join-Path $parentDir "helpers\rec.py"
     $recOutPath = Join-Path $recDir "$($label -replace '[^a-zA-Z0-9]', '_').mp4"
@@ -391,11 +858,55 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
         }
       }
     }
+    $script:RecordingPid = $recordingPid
+
+    $stem = ($label -replace '[^a-zA-Z0-9]', '_')
+    $dumpFile = Join-Path $netdumpDir "$stem.mitm"
+    $etlFile = Join-Path $etlDir "$stem.etl"
+    $mitmLogPath = Join-Path $mitmLogDir "$stem.mitmdump.log"
+    $script:MitmDumpFile = $dumpFile
+    if (Test-Path -LiteralPath $mitmLogPath) {
+        Remove-Item -LiteralPath $mitmLogPath -Force -ErrorAction SilentlyContinue
+    }
+    try {
+        $script:MitmProc = Start-Mitmdump -OutFile $dumpFile -Mode local -IgnoreHosts @(
+            '(^|\.)generativelanguage\.googleapis\.com$', '(^|\.)gradio\.live$'
+        ) -LogFile $mitmLogPath
+        if ($script:MitmProc) {
+            Write-Log "  mitmdump PID $($script:MitmProc.Id) writing to $dumpFile"
+        } else {
+            Warn "mitmdump failed to start; no process object returned."
+        }
+        $mitmReady = Wait-MitmdumpReady -Process $script:MitmProc -LogFile $mitmLogPath
+        if ($script:MitmProc -and $script:MitmProc.HasExited) {
+            $code = $script:MitmProc.ExitCode
+            Warn "mitmdump exited immediately with code $code"
+            if (Test-Path -LiteralPath $mitmLogPath) {
+                $tail = Get-Content -LiteralPath $mitmLogPath -Tail 20 -ErrorAction SilentlyContinue
+                foreach ($line in $tail) { Warn "mitmdump: $line" }
+            }
+        } elseif ($script:MitmProc -and -not $mitmReady) {
+            Warn "mitmdump local redirector was not ready after 20s. Store install may be aborted."
+        } elseif ($mitmReady) {
+            Write-Log "  mitmdump local redirector is ready."
+        }
+        if ($script:MitmProc -and -not $script:MitmProc.HasExited) {
+            $stackTemp = Join-Path $networkStackTempDir $stem
+            Start-NetworkStackCapture -TempDirectory $stackTemp -EtlFile $etlFile
+        }
+    } catch {
+        Warn "mitmdump failed to start: $($_.Exception.Message)"
+        $script:MitmProc = $null
+    }
 
     Write-Log ""
     Write-Log "------------------------------------------------"
     Write-Log "[$($i + 1)/$($apps.Count)] $label"
     Write-Log "------------------------------------------------"
+    Write-Log "  Pre-ID count: $(@($script:BaselinePids).Count)"
+
+    Start-UninstallDialogDriver -AppName $(if ($app.Name) { $app.Name } else { $label })
+    try {
 
     # -- STEP 1: INSTALL (same approach as scripts/install.ps1) --
     Write-Host "  Installing..."
@@ -472,11 +983,11 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
 
     Write-Log $installLog
 
-    # -- STEP 2: UNINSTALL (only if NOT 'exist') --
-    if ($status -eq 'exist') {
-        Write-Log "  Skipping uninstall - app already existed."
+    # -- STEP 2: UNINSTALL (only if NOT 'exist' or 'failure') --
+    if ($status -eq 'exist' -or $status -eq 'failure') {
+        Write-Log "  Skipping uninstall - app already existed or installation failed."
         $totalSkipped++
-        Stop-ScreenRecording
+        Stop-AppLeftoversThenRecording -AppName $label
         continue
     }
 
@@ -488,7 +999,7 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
         Write-Log "  Skipping uninstall - no display name available for registry lookup."
         $totalUninstallFailure++
         Add-UninstallMethodCount -Method 'no display name' -Status 'failure'
-        Stop-ScreenRecording
+        Stop-AppLeftoversThenRecording -AppName $label
         continue
     }
 
@@ -496,6 +1007,15 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
     $uniOutput = $null
     $uniExit   = 0
     $uiBefore  = Get-VisibleWindowMap
+
+    # Some apps refuse to uninstall while they are still running.
+    Write-Log "  Stopping new processes before uninstall."
+    Stop-NewAppProcesses -AppName $appName
+
+    if ($isAdmin -and $null -ne $uacConsentPromptAdminOriginal -and $uacConsentPromptAdminOriginal -ne 0) {
+        Set-ItemProperty -Path $uacKey -Name ConsentPromptBehaviorAdmin -Value 0 -Type DWord
+        Write-Log "UAC Consent Prompt Behavior Admin will be restored at the end."
+    }
 
     try {
         # *>&1 captures Write-Host (information stream) as well as success and error output.
@@ -562,14 +1082,22 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
     Write-Log $uninstallLog
 
     Wait-UninstallUi -Before $uiBefore -AppName $appName -StartedAt $startTime
-    Stop-ScreenRecording
+    } finally {
+        Stop-UninstallDialogDriver
+    }
+    Stop-AppLeftoversThenRecording -AppName $label
 }
 }
 finally {
-    Stop-ScreenRecording
+    Stop-UninstallDialogDriver
+    Stop-AppLeftoversThenRecording -AppName $label
     if ($isAdmin -and $null -ne $uacSecureDesktopOriginal -and $uacSecureDesktopOriginal -ne 0) {
         Set-ItemProperty -Path $uacKey -Name PromptOnSecureDesktop -Value $uacSecureDesktopOriginal -Type DWord
         Write-Log "UAC secure desktop setting restored."
+    }
+    if ($isAdmin -and $null -ne $uacConsentPromptAdminOriginal -and $uacConsentPromptAdminOriginal -ne 0) {
+        Set-ItemProperty -Path $uacKey -Name ConsentPromptBehaviorAdmin -Value $uacConsentPromptAdminOriginal -Type DWord
+        Write-Log "UAC consent prompt behavior admin setting restored."
     }
 }
 
@@ -579,8 +1107,8 @@ Write-Log "================================================"
 Write-Log "SUMMARY"
 Write-Log "================================================"
 Write-Log "Total apps processed : $($apps.Count)"
-Write-Log "Install   - exist: $totalExist  success: $totalSuccess  failure: $totalFailure"
-Write-Log "Uninstall - success: $totalUninstallSuccess  failure: $totalUninstallFailure  skipped (exist): $totalSkipped"
+Write-Log "Install   - success: $totalSuccess exist: $totalExist    failure: $totalFailure"
+Write-Log "Uninstall - success: $totalUninstallSuccess  failure: $totalUninstallFailure  skipped: $totalSkipped"
 Write-Log "Uninstall methods:"
 foreach ($name in $uniMethodNames) {
     $n = $uniMethodTotal[$name]
@@ -589,4 +1117,7 @@ foreach ($name in $uniMethodNames) {
 }
 Write-Log "=== Invoke-TestPower finished: $(Get-Date) ==="
 Write-Host ""
+winget settings --disable BypassCertificatePinningForMicrosoftStore
+Write-Log "BypassCertificatePinningForMicrosoftStore disabled."
 Write-Host "Log saved to: $logPath"
+

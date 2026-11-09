@@ -144,6 +144,57 @@ function Find-SquirrelUninstall([string]$Name) {
     $null
 }
 
+function Get-DerivedQuietUninstallString($app) {
+    if ($app.QuietUninstallString) { return [string]$app.QuietUninstallString }
+
+    if ($app.WindowsInstaller -eq 1 -and $app.PSChildName -match '^\{[0-9A-Fa-f-]+\}$') {
+        return "msiexec.exe /x $($app.PSChildName) /qn /norestart"
+    }
+
+    $u = [string]$app.UninstallString
+    if (-not $u) { return $null }
+
+    # Squirrel (Discord, Slack, ...)
+    if ($u -match 'Update\.exe') {
+        if ($u -match '--uninstall') { return ($u -replace '--uninstall.*', '--uninstall -s') }
+        return "$u --uninstall -s"
+    }
+
+    # Chromium (Brave, Chrome, Edge, Opera, Vivaldi)
+    if ($u -match 'Installer\\setup\.exe' -and $u -match '--uninstall') {
+        if ($u -match '--force-uninstall') { return $u }
+        return "$u --force-uninstall"
+    }
+
+    # Inno Setup
+    if ($u -match '(?i)unins\d+\.exe') {
+        if ($u -match '/VERYSILENT') { return $u }
+        return "$u /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-"
+    }
+
+    $null
+}
+
+function Invoke-QuietUninstallCommand([string]$quiet) {
+    if ($quiet -match '^"([^"]+)"\s*(.*)$') {
+        $exe  = $Matches[1]
+        $args = $Matches[2]
+    } elseif ($quiet -match '^(\S+)\s+(.*)$') {
+        $exe  = $Matches[1]
+        $args = $Matches[2]
+    } else {
+        $exe  = $quiet
+        $args = $null
+    }
+
+    if ($args) {
+        $argList = if ($args -match '"') { $args } else { @($args -split '\s+' | Where-Object { $_ }) }
+        Start-Process -FilePath $exe -ArgumentList $argList -Wait -NoNewWindow
+    } else {
+        Start-Process -FilePath $exe -Wait -NoNewWindow
+    }
+}
+
 function Stop-MatchingProcesses([string]$Name) {
     if (-not $Name -or $Name.Trim().Length -lt 4) { return }
     $n = Normalize-Name $Name
@@ -247,9 +298,13 @@ function Invoke-WingetUninstallUnelevated {
 
 function Invoke-WingetUninstallWithFallback {
     param(
-        [Parameter(Mandatory)][string]$Id,
+        [string]$Id,
         [string]$Name
     )
+
+    if (-not $Id -and -not $Name) {
+        return [pscustomobject]@{ ExitCode = -1; Output = 'No winget id or name provided' }
+    }
 
     $common = @('--silent', '--disable-interactivity', '--accept-source-agreements')
     $argSets = New-Object 'System.Collections.Generic.List[object]'
@@ -428,6 +483,7 @@ if (-not $match -and -not $storePkg) {
 }
 
 $startTime = Get-Date
+$wingetExit = 0
 
 if ($useWinget) {
     $displayName = $ApplicationName
@@ -460,73 +516,24 @@ if ($useWinget) {
     }, DisplayName | Select-Object -First 1
 
     $displayName = $match.DisplayName
-
-    # Build the QuietUninstallString for MSI products if missing
-    $quiet = $match.QuietUninstallString
-    if (-not $quiet -and $match.WindowsInstaller -eq 1 -and $match.PSChildName -match '^\{[0-9A-Fa-f-]+\}$') {
-        $quiet = "msiexec.exe /x $($match.PSChildName) /qn /norestart"
-    }
+    $quiet = Get-DerivedQuietUninstallString $match
 
     Write-Host "Application found : $($match.DisplayName) (v$($match.DisplayVersion))"
     Stop-MatchingProcesses $ApplicationName
-
-    # Squirrel (Discord, Slack, Teams classic, ...) uses Update.exe --uninstall -s
-    if (-not $quiet -and $match.UninstallString -match 'Update\.exe') {
-        if ($match.UninstallString -match '--uninstall') {
-            $quiet = ($match.UninstallString -replace '--uninstall.*', '--uninstall -s')
-        } else {
-            $quiet = "$($match.UninstallString) --uninstall -s"
-        }
-    }
 
     if ($quiet) {
         $methodName = if ($quiet -match 'msiexec') { 'msiexec' } else { 'QuietUninstallString' }
         Write-Host "Using QuietUninstallString: $quiet"
         Write-UninstallMethod $methodName
-
-        # Split the command into executable and arguments
-        if ($quiet -match '^"([^"]+)"\s*(.*)$') {
-            $exe  = $Matches[1]
-            $args = $Matches[2]
-        } elseif ($quiet -match '^(\S+)\s+(.*)$') {
-            $exe  = $Matches[1]
-            $args = $Matches[2]
-        } else {
-            $exe  = $quiet
-            $args = $null
-        }
-
-        if ($args) {
-            $argList = if ($args -match '"') { $args } else { @($args -split '\s+' | Where-Object { $_ }) }
-            Start-Process -FilePath $exe -ArgumentList $argList -Wait -NoNewWindow
-        } else {
-            Start-Process -FilePath $exe -Wait -NoNewWindow
-        }
+        Invoke-QuietUninstallCommand $quiet
     } else {
-        $uninstall = $match.UninstallString
-        if (-not $uninstall) {
-            Write-UninstallMethod 'no uninstall string'
-            Write-Error "No uninstall string available for '$($match.DisplayName)'."
-            exit 1
-        }
-
-        $silentArgs = "/S /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /quiet /norestart /qn /norestart"
-        Write-Host "No QuietUninstallString found. Using UninstallString with silent args: $uninstall"
-        Write-UninstallMethod 'UninstallString'
-
-        # Split the command into executable and arguments, then append silent flags
-        if ($uninstall -match '^"([^"]+)"\s*(.*)$') {
-            $exe  = $Matches[1]
-            $args = "$($Matches[2]) $silentArgs".Trim()
-        } elseif ($uninstall -match '^(\S+)\s+(.*)$') {
-            $exe  = $Matches[1]
-            $args = "$($Matches[2]) $silentArgs".Trim()
-        } else {
-            $exe  = $uninstall
-            $args = $silentArgs
-        }
-
-        Start-Process -FilePath $exe -ArgumentList $args -Wait -NoNewWindow
+        # Do not run UninstallString: it is interactive for Brave/CapCut/Discord-style apps.
+        Write-Host "No silent uninstaller for '$displayName'. Falling back to winget."
+        Write-UninstallMethod 'winget'
+        $useWinget = $true
+        $result = Invoke-WingetUninstallWithFallback -Id $Id -Name $ApplicationName
+        $wingetExit = if ($result) { [int]$result.ExitCode } else { -1 }
+        Write-Output "WINGET_EXIT=$wingetExit"
     }
 }
 
@@ -543,3 +550,4 @@ if ($useWinget -and $wingetExit -ne 0) {
 }
 
 Write-Host "Uninstallation of '$displayName' completed in $($elapsedTime.ToString('mm\:ss'))"
+exit 0
