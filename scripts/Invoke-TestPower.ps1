@@ -51,8 +51,8 @@ if (-not (Test-Path -LiteralPath $mitmLogDir)) {
     New-Item -ItemType Directory -Path $mitmLogDir -Force | Out-Null
 }
 
-# wpr writes temporary trace files here. The finished .etl is saved next to the .mitm.
-$networkStackTempDir = Join-Path $parentDir 'results\logs\network-stacks'
+# wpr keeps in-progress traces here. Stop-NetworkStackTrace.ps1 deletes this directory.
+$networkStackTempDir = Join-Path $env:TEMP 'MicrosoftStoreAppMgr\network-stacks'
 $startNetworkStackTrace = Join-Path $scriptDir 'Start-NetworkStackTrace.ps1'
 $stopNetworkStackTrace = Join-Path $scriptDir 'Stop-NetworkStackTrace.ps1'
 
@@ -905,7 +905,7 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
     Write-Log "------------------------------------------------"
     Write-Log "  Pre-ID count: $(@($script:BaselinePids).Count)"
 
-    Start-UninstallDialogDriver -AppName $(if ($app.Name) { $app.Name } else { $label })
+    
     try {
 
     # -- STEP 1: INSTALL (same approach as scripts/install.ps1) --
@@ -1011,6 +1011,8 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
     # Some apps refuse to uninstall while they are still running.
     Write-Log "  Stopping new processes before uninstall."
     Stop-NewAppProcesses -AppName $appName
+
+    Start-UninstallDialogDriver -AppName $(if ($app.Name) { $app.Name } else { $label })
 
     if ($isAdmin -and $null -ne $uacConsentPromptAdminOriginal -and $uacConsentPromptAdminOriginal -ne 0) {
         Set-ItemProperty -Path $uacKey -Name ConsentPromptBehaviorAdmin -Value 0 -Type DWord

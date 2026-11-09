@@ -7,6 +7,7 @@
 # which can. The session is machine-wide and must run elevated.
 #
 # Stop the session with Stop-NetworkStackTrace.ps1 when the test ends.
+# In-progress traces go to %TEMP%. That script deletes them after wpr -stop.
 # Winsock events are logged for every process, so the ETL grows quickly.
 
 #Requires -RunAsAdministrator
@@ -23,7 +24,7 @@ $parentDir = Split-Path -Parent $scriptDir
 if (-not $parentDir) { $parentDir = (Get-Location).Path }
 
 if (-not $OutputDirectory) {
-    $OutputDirectory = Join-Path $parentDir 'results\logs\network-stacks'
+    $OutputDirectory = Join-Path $env:TEMP 'MicrosoftStoreAppMgr\network-stacks'
 } elseif (-not [System.IO.Path]::IsPathRooted($OutputDirectory)) {
     $OutputDirectory = Join-Path (Get-Location).Path $OutputDirectory
 }

@@ -49,8 +49,8 @@ if (-not (Test-Path -LiteralPath $mitmLogDir)) {
     New-Item -ItemType Directory -Path $mitmLogDir -Force | Out-Null
 }
 
-# wpr writes temporary trace files here. The finished .etl is saved next to the .mitm.
-$networkStackTempDir = Join-Path $parentDir 'results\logs\network-stacks'
+# wpr keeps in-progress traces here. Stop-NetworkStackTrace.ps1 deletes this directory.
+$networkStackTempDir = Join-Path $env:TEMP 'MicrosoftStoreAppMgr\network-stacks'
 $startNetworkStackTrace = Join-Path $scriptDir 'Start-NetworkStackTrace.ps1'
 $stopNetworkStackTrace = Join-Path $scriptDir 'Stop-NetworkStackTrace.ps1'
 

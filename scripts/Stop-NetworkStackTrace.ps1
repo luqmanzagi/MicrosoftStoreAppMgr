@@ -10,6 +10,7 @@
 #
 # -skipPdbGen keeps this from spending minutes generating NGEN PDBs.
 # Module names still resolve. Function names need symbols later in WPA.
+# The -recordtempto directory is scratch. It is removed after wpr -stop.
 
 #Requires -RunAsAdministrator
 
@@ -50,11 +51,13 @@ if (-not $state -and -not $Force) {
     throw "WPR is recording, but Start-NetworkStackTrace.ps1 did not start it. Re-run with -Force to stop that session anyway.`n$status"
 }
 
+$tempDir = $null
+if ($state -and $state.OutputDirectory) {
+    $tempDir = [string]$state.OutputDirectory
+}
+
 if (-not $OutputFile) {
-    $dir = $state.OutputDirectory
-    if (-not $dir) {
-        $dir = Join-Path $parentDir 'results\logs\network-stacks'
-    }
+    $dir = Join-Path $parentDir 'results\logs\etl'
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
     $stamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
     $OutputFile = Join-Path $dir "network-stacks_$stamp.etl"
@@ -87,6 +90,29 @@ if (-not (Test-Path -LiteralPath $OutputFile)) {
 
 if (Test-Path -LiteralPath $stateFile) {
     Remove-Item -LiteralPath $stateFile -Force
+}
+
+if ($tempDir -and (Test-Path -LiteralPath $tempDir)) {
+    $tempFull = [System.IO.Path]::GetFullPath($tempDir).TrimEnd('\')
+    $outputFull = [System.IO.Path]::GetFullPath($OutputFile).TrimEnd('\')
+    $outputInside = $outputFull.Equals($tempFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $outputFull.StartsWith($tempFull + '\', [System.StringComparison]::OrdinalIgnoreCase)
+    try {
+        if (-not $outputInside -and $tempFull.Length -gt 3) {
+            Remove-Item -LiteralPath $tempFull -Recurse -Force -ErrorAction Stop
+            Write-Host "Removed temporary trace files: $tempFull"
+        } elseif ($outputInside -and -not $outputFull.Equals($tempFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Get-ChildItem -LiteralPath $tempFull -Force -ErrorAction Stop | ForEach-Object {
+                $child = $_.FullName.TrimEnd('\')
+                if (-not $child.Equals($outputFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    Remove-Item -LiteralPath $child -Recurse -Force -ErrorAction Stop
+                }
+            }
+            Write-Host "Removed temporary trace files from $tempFull"
+        }
+    } catch {
+        Write-Warning "Could not remove temporary trace files at ${tempFull}: $($_.Exception.Message)"
+    }
 }
 
 $item = Get-Item -LiteralPath $OutputFile
