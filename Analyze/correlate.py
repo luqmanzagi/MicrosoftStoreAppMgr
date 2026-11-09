@@ -310,7 +310,10 @@ def correlate(flows, etl):
                 "host": host,
                 "method": flow.get("method") or "",
                 "path": (flow.get("path") or "").split("?")[0][:140],
+                "query": (flow.get("path") or "").partition("?")[2],
                 "qtype": flow.get("qtype") or "",
+                "body": flow.get("body") or "",
+                "referer": flow.get("referer") or "",
                 "destination_kind": destination_kind(
                     exe, process_name, host, info["webview_host"], command
                 ),

@@ -38,9 +38,11 @@ def read_flows(path):
                     {
                         "host": request.pretty_host,
                         "method": request.method,
-                        "path": request.path[:300],
+                        "path": request.path,
                         "scheme": request.scheme,
                         "status": response.status_code if response else None,
+                        "body": request.get_text(strict=False) or "",
+                        "referer": request.headers.get("referer", ""),
                     }
                 )
             elif kind == "DNSFlow" and flow.request:
