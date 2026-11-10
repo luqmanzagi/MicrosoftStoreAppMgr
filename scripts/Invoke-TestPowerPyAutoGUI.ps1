@@ -118,8 +118,8 @@ if ($jsonContent -is [Array]) {
 # Painted-button uninstallers that pywinauto could not click. Empty this to
 # run every app in apps_manual.json.
 $onlyNames = @(
-    'Data Recovery Software - Recover Deleted & Lost Files for Windows',
-    'Malwarebytes'
+    'Citrix Workspace App',
+    'CapCut'
 )
 if ($onlyNames.Count -gt 0) {
     $want = @{}
