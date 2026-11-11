@@ -49,6 +49,7 @@ _RANKS = (
     ("submit", re.compile(r"^\s*submit and uninstall\b", re.IGNORECASE)),
     ("remove", re.compile(r"^\s*(remove\b|删除)", re.IGNORECASE)),
     ("delete", re.compile(r"^\s*delete\b", re.IGNORECASE)),
+    ("restart later", re.compile(r"^\s*restart later\b", re.IGNORECASE)),
     ("yes", re.compile(r"^\s*(yes|是)\s*$", re.IGNORECASE)),
     ("skip", re.compile(r"^\s*(skip\b|no thanks\b|not now\b|跳过)", re.IGNORECASE)),
     ("next", re.compile(r"^\s*(next\b|下一步)", re.IGNORECASE)),
@@ -66,7 +67,7 @@ _RANKS = (
 )
 # These advance a wizard. They are only safe once the window is already an
 # uninstaller (title, process, or the text "uninstall" / "why you're leaving").
-_PROGRESS = {"yes", "skip", "next", "continue", "proceed", "ok", "agree", "finish", "complete", "close"}
+_PROGRESS = {"restart later", "yes", "skip", "next", "continue", "proceed", "ok", "agree", "finish", "complete", "close"}
 # Survey radios are painted. Windows OCR reads the circle as "C)", so the
 # line is "C) Other" rather than "Other".
 _RADIO_PREFIX = re.compile(r"^\s*[A-Za-z0-9]\s*\)\s*")
@@ -84,8 +85,9 @@ _COMPLETE_HEADING = re.compile(r"^\s*uninstall complete\b", re.IGNORECASE)
 _CONFIRM_RE = re.compile(r"are you sure", re.IGNORECASE)
 # "Close" is ignored until one of these is on screen. Otherwise it dismisses the wizard.
 _DONE_RE = re.compile(
-    r"(uninstall\s+successful|successfully\s+uninstalled|has\s+been\s+uninstalled|"
-    r"uninstall(?:ation)?\s+complete)",
+    # r"(uninstall\s+successful|successfully\s+uninstalled|has\s+been\s+uninstalled|"
+    r"uninstall(?:ation)?\s+complete|\bcompleted\b)",
+    r"\buninstall\w*[^\n]*\bsuccess\w*|\bsuccess\w*[^\n]*\buninstall\w*|has\s+been\s+uninstalled|",
     re.IGNORECASE,
 )
 _REASON = "MSProjectUninstall"
@@ -395,9 +397,10 @@ def pick_control(
     for rank, name, line in _iter_controls(lines, related, uac, done):
         if name in blocked:
             continue
-        # Lower rank wins. Same label: prefer the wider phrase ("Skip this step"
-        # over the word "Skip"), then the one further down the window.
-        key = (rank, -line.w, -line.y)
+        # Lower rank wins. Same label: prefer the one further down the window
+        # ("Uninstall" under the wider "Uninstall WeChat" title). Same height:
+        # prefer the wider phrase.
+        key = (rank, -line.y, -line.w)
         if best_key is None or key < best_key:
             best_key = key
             best = line
