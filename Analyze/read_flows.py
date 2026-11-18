@@ -31,6 +31,12 @@ def read_flows(path):
                 record["client_sock"] = _endpoint(getattr(client, "sockname", None))
             if server is not None:
                 record["sni"] = getattr(server, "sni", None)
+            if kind == "DNSFlow":
+                record["proto"] = "udp"
+            elif "UDP" in kind.upper():
+                record["proto"] = "udp"
+            else:
+                record["proto"] = "tcp"
             if kind == "HTTPFlow" and flow.request:
                 request = flow.request
                 response = flow.response

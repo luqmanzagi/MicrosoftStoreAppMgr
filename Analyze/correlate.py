@@ -57,8 +57,11 @@ WINDOWS_HOSTS = (
     "microsoft.com", "microsoftonline", "live.com", "bing.com", "msedge.net",
     "skype.com", "windows.com", "windows.net", "msn.com", "footprintdns",
 )
-OWNER_EVENTS = (1033, 1300, 1002, 1017, 1031)
-STACK_EVENTS = {1002: 0, 1033: 1, 1300: 2, 1017: 3, 1031: 4}
+OWNER_EVENTS = (1033, 1300, 1002, 1017, 1031, 1007, 1013, 1018, 1021)
+STACK_EVENTS = {
+    1002: 0, 1033: 1, 1300: 2, 1017: 3, 1031: 4,
+    1007: 0, 1013: 0, 1018: 1, 1021: 1,
+}
 
 
 def basename(path):
@@ -266,10 +269,26 @@ def classify(process_name, exe, command, frames):
     }
 
 
+def norm_ip(value):
+    text = (value or "").strip().lower()
+    if text.startswith("::ffff:"):
+        text = text[7:]
+    return text
+
+
 def correlate(flows, etl):
     by_tuple = defaultdict(list)
+    by_remote = defaultdict(list)
     for connection in etl["connections"]:
-        by_tuple[(connection["lip"], connection["lp"], connection["rip"], connection["rp"])].append(connection)
+        key = (
+            norm_ip(connection["lip"]),
+            connection["lp"],
+            norm_ip(connection["rip"]),
+            connection["rp"],
+        )
+        by_tuple[key].append(connection)
+        if connection.get("proto") == "udp" and connection["rp"]:
+            by_remote[(norm_ip(connection["rip"]), connection["rp"])].append(connection)
 
     start = etl["start"].timestamp() if etl["start"] else None
     end = etl["end"].timestamp() if etl["end"] else None
@@ -285,9 +304,19 @@ def correlate(flows, etl):
         if not peer or not sock:
             unmatched.append(host)
             continue
-        candidates = by_tuple.get((peer[0], peer[1], sock[0], sock[1]))
+        proto = flow.get("proto")
+        candidates = by_tuple.get((norm_ip(peer[0]), peer[1], norm_ip(sock[0]), sock[1]))
         if not candidates:
-            candidates = by_tuple.get((sock[0], sock[1], peer[0], peer[1]))
+            candidates = by_tuple.get((norm_ip(sock[0]), sock[1], norm_ip(peer[0]), peer[1]))
+        if candidates and proto:
+            candidates = [item for item in candidates if item.get("proto") in (None, proto)]
+        # A UDP datagram event has the destination and the caller. It does not
+        # carry the source port, so DNS and other UDP flows join on the remote
+        # address after the 4-tuple misses.
+        if not candidates and proto == "udp":
+            candidates = by_remote.get((norm_ip(sock[0]), sock[1]))
+            if not candidates:
+                candidates = by_remote.get((norm_ip(peer[0]), peer[1]))
         if not candidates:
             unmatched.append(host)
             continue
@@ -353,7 +382,7 @@ def render_report(flow_path, etl_path, etl, matched, unmatched):
     lines.append(f"Flow file: {flow_path}")
     lines.append(f"ETL file:  {etl_path}")
     lines.append(f"Matched connections in the overlap: {len(matched)}")
-    lines.append(f"Flows in the overlap with no TCP match: {len(unmatched)}")
+    lines.append(f"Flows in the overlap with no connection match: {len(unmatched)}")
     lines.append("")
     lines.append("First-party means the process's own binary made the call.")
     lines.append("Third-party means a WebView, a hook DLL, or another vendor's module made it.")
@@ -402,7 +431,7 @@ def render_report(flow_path, etl_path, etl, matched, unmatched):
 
     if unmatched:
         lines.append("")
-        lines.append("In the overlap, but no matching TCP connection in the ETL")
+        lines.append("In the overlap, but no matching connection in the ETL")
         for host, count in Counter(unmatched).most_common(20):
             lines.append(f"  {count:4d}  {host}")
     return "\n".join(lines) + "\n"

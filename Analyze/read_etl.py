@@ -35,9 +35,18 @@ def split_addr(value):
     value = value.strip()
     if value.startswith("["):
         host, port = value[1:].split("]:")
-        return host, int(port)
+        return norm_ip(host), int(port)
+    if ":" not in value:
+        return None
     host, port = value.rsplit(":", 1)
-    return host, int(port)
+    return norm_ip(host), int(port)
+
+
+def norm_ip(value):
+    text = (value or "").strip().lower()
+    if text.startswith("::ffff:"):
+        text = text[7:]
+    return text
 
 
 def _stamp(chunk):
@@ -122,7 +131,8 @@ def _parse_xml(xml_path):
             is_process = "ImageFileName" in chunk and "UniqueProcessKey" in chunk
             is_image = "ImageBase" in chunk and "ImageSize" in chunk and "FileName" in chunk
             is_tcp = "Microsoft-Windows-TCPIP" in chunk and "RemoteAddress" in chunk
-            if not (is_user_stack or is_process or is_image or is_tcp):
+            is_udp = "Microsoft-Windows-Winsock-AFD" in chunk and 'Name="Address"' in chunk
+            if not (is_user_stack or is_process or is_image or is_tcp or is_udp):
                 continue
 
             stamp = _stamp(chunk)
@@ -186,24 +196,49 @@ def _parse_xml(xml_path):
                     )
                 continue
 
-            remote = fields.get("RemoteAddress")
-            local = fields.get("LocalAddress")
-            if not remote or not local:
-                continue
-            local_ip, local_port = split_addr(local)
-            remote_ip, remote_port = split_addr(remote)
             event_match = EVENTID_RE.search(chunk)
             event_id = int(event_match.group(1)) if event_match else None
             field_pid = parse_num(fields.get("Pid") or fields.get("ProcessId") or "0") or 0
             exec_match = EXEC_PID_RE.search(chunk)
             exec_pid = int(exec_match.group(1)) if exec_match else 0
-            # 1002 has no Pid field. 1031 reports ProcessId 0. On both, the
-            # executing process is the caller. Rundown event 1300 is logged
-            # by the trace session, so only its Pid field owns the socket.
-            if event_id in (1002, 1031):
+            if is_udp:
+                # Enter and exit are both logged. The entry stack is the caller.
+                if (fields.get("EnterExit") or "").strip() == "1":
+                    continue
+                if event_id not in (1007, 1013, 1018, 1021):
+                    continue
+                parsed = split_addr(fields.get("Address") or "")
+                if not parsed:
+                    continue
+                remote_ip, remote_port = parsed
+                # QUIC. Connected QUIC data is AfdSend and is not collected.
+                # A sendto or connect aimed at UDP/443 is the same traffic.
+                if remote_port == 443:
+                    continue
+                local_ip, local_port = "", None
                 pid = exec_pid or field_pid
+                proto = "udp"
+                inline_stack = [int(item, 16) for item in ADDR_RE.findall(chunk)]
             else:
-                pid = field_pid
+                remote = fields.get("RemoteAddress")
+                local = fields.get("LocalAddress")
+                if not remote or not local:
+                    continue
+                local_parsed = split_addr(local)
+                remote_parsed = split_addr(remote)
+                if not local_parsed or not remote_parsed:
+                    continue
+                local_ip, local_port = local_parsed
+                remote_ip, remote_port = remote_parsed
+                # 1002 has no Pid field. 1031 reports ProcessId 0. On both, the
+                # executing process is the caller. Rundown event 1300 is logged
+                # by the trace session, so only its Pid field owns the socket.
+                if event_id in (1002, 1031):
+                    pid = exec_pid or field_pid
+                else:
+                    pid = field_pid
+                proto = "tcp"
+                inline_stack = None
             record = {
                 "eid": event_id,
                 "pid": pid,
@@ -211,15 +246,19 @@ def _parse_xml(xml_path):
                 "lp": local_port,
                 "rip": remote_ip,
                 "rp": remote_port,
+                "proto": proto,
                 "t": stamp,
             }
+            if inline_stack:
+                record["ustack"] = inline_stack
+                record["ustack_pid"] = pid
             connections.append(record)
             match = MATCH_RE.search(chunk)
-            if match:
+            if match and int(match.group(1), 16) != 0:
                 pending[match.group(1)] = record
 
     print(
-        f"Parsed {seen} events, {len(processes)} process records, {len(connections)} TCP rows",
+        f"Parsed {seen} events, {len(processes)} process records, {len(connections)} connection rows",
         file=sys.stderr,
         flush=True,
     )
