@@ -117,15 +117,15 @@ if ($jsonContent -is [Array]) {
 
 # Painted-button uninstallers that pywinauto could not click. Empty this to
 # run every app in apps_manual.json.
-$onlyNames = @(
-    'Citrix Workspace App',
-    'CapCut'
-)
-if ($onlyNames.Count -gt 0) {
-    $want = @{}
-    foreach ($n in $onlyNames) { $want[$n] = $true }
-    $apps = @($apps | Where-Object { $want.ContainsKey($_.Name) })
-}
+# $onlyNames = @(
+#     'Citrix Workspace App',
+#     'CapCut'
+# )
+# if ($onlyNames.Count -gt 0) {
+#     $want = @{}
+#     foreach ($n in $onlyNames) { $want[$n] = $true }
+#     $apps = @($apps | Where-Object { $want.ContainsKey($_.Name) })
+# }
 
 Write-Log "=== Invoke-TestPowerPyAutoGUI started: $(Get-Date) ==="
 Write-Log "Loaded $($apps.Count) app(s) from $jsonPath"
@@ -373,6 +373,31 @@ function ConvertTo-ProcessArgList {
     }) -join ' '
 }
 
+function Resolve-DialogPython {
+    if ($script:DialogPython -and (Test-Path -LiteralPath $script:DialogPython)) {
+        return $script:DialogPython
+    }
+    $candidates = @()
+    if ($env:CONDA_PREFIX) {
+        $candidates += Join-Path $env:CONDA_PREFIX 'python.exe'
+    }
+    $candidates += Join-Path $env:USERPROFILE '.conda\envs\msstore\python.exe'
+    $onPath = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($onPath -and $onPath.Source) { $candidates += [string]$onPath.Source }
+    $seen = @{}
+    foreach ($py in $candidates) {
+        if (-not $py -or $seen.ContainsKey($py)) { continue }
+        $seen[$py] = $true
+        if (-not (Test-Path -LiteralPath $py)) { continue }
+        & $py -c "import pyautogui" *> $null
+        if ($LASTEXITCODE -eq 0) {
+            $script:DialogPython = $py
+            return $py
+        }
+    }
+    return $null
+}
+
 function Start-UninstallDialogDriver {
     param(
         [string]$AppName,
@@ -385,6 +410,11 @@ function Start-UninstallDialogDriver {
     }
     if (-not $script:PyAutoGuiLog) {
         Warn "PyAutoGUI log path is not set; dialog watcher will not start."
+        return
+    }
+    $dialogPython = Resolve-DialogPython
+    if (-not $dialogPython) {
+        Warn "No Python with PyAutoGUI found (checked CONDA_PREFIX, the msstore conda env, and python on PATH). Dialog watcher will not start."
         return
     }
     $argList = @(
@@ -405,12 +435,13 @@ function Start-UninstallDialogDriver {
     $argString = ConvertTo-ProcessArgList $argList
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = 'python'
+        $psi.FileName = $dialogPython
         $psi.Arguments = $argString
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
         $script:UninstallUiProc = [System.Diagnostics.Process]::Start($psi)
         Write-Log "  Watching for uninstall dialogs (PyAutoGUI PID $($script:UninstallUiProc.Id))."
+        Write-Log "  PyAutoGUI python: $dialogPython"
         Write-Log "  PyAutoGUI log: $($script:PyAutoGuiLog)"
     } catch {
         Warn "Could not start uninstall dialog driver: $($_.Exception.Message)"

@@ -85,9 +85,8 @@ _COMPLETE_HEADING = re.compile(r"^\s*uninstall complete\b", re.IGNORECASE)
 _CONFIRM_RE = re.compile(r"are you sure", re.IGNORECASE)
 # "Close" is ignored until one of these is on screen. Otherwise it dismisses the wizard.
 _DONE_RE = re.compile(
-    # r"(uninstall\s+successful|successfully\s+uninstalled|has\s+been\s+uninstalled|"
-    r"uninstall(?:ation)?\s+complete|\bcompleted\b)",
-    r"\buninstall\w*[^\n]*\bsuccess\w*|\bsuccess\w*[^\n]*\buninstall\w*|has\s+been\s+uninstalled|",
+    r"uninstall(?:ation)?\s+complete|\bcompleted\b|"
+    r"\buninstall\w*[^\n]*\bsuccess\w*|\bsuccess\w*[^\n]*\buninstall\w*|has\s+been\s+uninstalled",
     re.IGNORECASE,
 )
 _REASON = "MSProjectUninstall"
