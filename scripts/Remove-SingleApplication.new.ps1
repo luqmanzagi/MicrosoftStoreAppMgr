@@ -3,7 +3,13 @@ param(
     [string]$ApplicationName,
 
     [Parameter(Mandatory=$false, HelpMessage="Optional winget/Store package ID used if name lookup fails")]
-    [string]$Id
+    [string]$Id,
+
+    [Parameter(Mandatory=$false, HelpMessage="Package identity from the pre/post install diff")]
+    [string]$PackageId,
+
+    [Parameter(Mandatory=$false, HelpMessage="AppType from the pre/post install diff: MSIX, DesktopBridge, PWA, Win32, Squirrel, Portable")]
+    [string]$AppType
 )
 
 # ---- Registry lookup (reused from Find-AppUninstallInfo.ps1) ----
@@ -412,6 +418,39 @@ function Find-RegistryMatch([string]$ApplicationName) {
 }
 
 # ---- Find matching application (Win32 registry, Squirrel, then Store/MSIX) ----
+# A package diff identity targets the app this install added. Name lookup stays
+# the fallback when that package is already gone.
+$mappedAppx = $null
+$mappedWin32 = $null
+$mappedPortable = $null
+if ($PackageId -and $AppType -match '^(MSIX|DesktopBridge|PWA)$') {
+    $candidates = @(Get-AppxPackage -ErrorAction SilentlyContinue)
+    if (Test-IsProcessElevated) {
+        $candidates += @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)
+    }
+    $mappedAppx = $candidates |
+        Where-Object { $_.PackageFullName -eq $PackageId } |
+        Sort-Object PackageFullName -Unique |
+        Select-Object -First 1
+    if (-not $mappedAppx) {
+        Write-Host "Mapped package '$PackageId' is not installed. Falling back to name lookup."
+    }
+} elseif ($PackageId -and $AppType -match '^(Win32|Squirrel)$') {
+    $mappedWin32 = @(Get-UninstallRegistryApps) |
+        Where-Object { $_.PSChildName -eq $PackageId } |
+        Select-Object -First 1
+    if (-not $mappedWin32) {
+        Write-Host "Mapped uninstall key '$PackageId' is not present. Falling back to name lookup."
+    }
+} elseif ($PackageId -and $AppType -eq 'Portable') {
+    $portableFolder = Join-Path (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages') $PackageId
+    if (Test-Path -LiteralPath $portableFolder) {
+        $mappedPortable = $portableFolder
+    } else {
+        Write-Host "Mapped portable folder '$portableFolder' is not present. Falling back to name lookup."
+    }
+}
+
 # Store/Win32 bootstrappers (Discord) often finish after winget reports success.
 $needle = Normalize-Name $ApplicationName
 $match = @()
@@ -422,6 +461,7 @@ $storeScore = 0
 $maxLookupAttempts = 6
 
 for ($lookupTry = 1; $lookupTry -le $maxLookupAttempts; $lookupTry++) {
+    if ($mappedAppx -or $mappedWin32 -or $mappedPortable) { break }
     $regHit = Find-RegistryMatch $ApplicationName
     $match = @($regHit.Match)
     $regScore = [int]$regHit.Score
@@ -458,6 +498,14 @@ for ($lookupTry = 1; $lookupTry -le $maxLookupAttempts; $lookupTry++) {
     }
 }
 
+if ($mappedAppx) {
+    $storePkg = $mappedAppx
+    $match = @()
+} elseif ($mappedWin32) {
+    $match = @($mappedWin32)
+    $storePkg = $null
+}
+
 # ---- Logging setup ----
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
@@ -472,7 +520,7 @@ $dateStr  = Get-Date -Format 'yyyy-MM-dd'
 $logPath  = Join-Path $logDir "$dateStr.log"
 
 $useWinget = $false
-if (-not $match -and -not $storePkg) {
+if (-not $mappedPortable -and -not $match -and -not $storePkg) {
     if ($Id) {
         $useWinget = $true
     } else {
@@ -485,7 +533,13 @@ if (-not $match -and -not $storePkg) {
 $startTime = Get-Date
 $wingetExit = 0
 
-if ($useWinget) {
+if ($mappedPortable) {
+    $displayName = if ($ApplicationName) { $ApplicationName } else { $PackageId }
+    Write-Host "Application found : $displayName [Portable]"
+    Write-Host "Removing mapped portable folder: $mappedPortable"
+    Write-UninstallMethod 'portable folder'
+    Remove-Item -LiteralPath $mappedPortable -Recurse -Force
+} elseif ($useWinget) {
     $displayName = $ApplicationName
     Write-Host "Name lookup missed '$ApplicationName'. Falling back to winget."
     Write-UninstallMethod 'winget'
@@ -502,6 +556,7 @@ if ($useWinget) {
     } catch { }
 
     Write-Host "Application found : $displayName (v$($storePkg.Version)) [Store/MSIX]"
+    if ($mappedAppx) { Write-Host "Mapped package: $($storePkg.PackageFullName)" }
     Write-Host "Using Remove-AppxPackage: $($storePkg.PackageFullName)"
     Write-UninstallMethod 'Remove-AppxPackage'
     if (Test-IsProcessElevated) {

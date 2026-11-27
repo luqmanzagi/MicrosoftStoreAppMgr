@@ -7,7 +7,10 @@
 # is called from New-BaselineRestorePoint only, and only when that
 # baseline does not already exist.
 #
-# For each app: install, then scripts\Remove-SingleApplication.hybrid.ps1.
+# For each app: snapshot installed packages, install, map the new app into
+# results\store_app_mappings.csv, then scripts\Remove-SingleApplication.hybrid.ps1.
+# The package diff is passed through so that script removes the package this
+# install added instead of a same-named app.
 # A silent uninstall (QuietUninstallString, msiexec, or Remove-AppxPackage)
 # runs in place and the loop continues with the next app.
 # When there is no silent uninstall, this script restores that one point.
@@ -55,6 +58,8 @@ $script:FrequencyName = 'SystemRestorePointCreationFrequency'
 $script:MarkerKey = 'HKLM:\SOFTWARE\MicrosoftStoreAppMgr'
 $script:MarkerName = 'HybridRestorePending'
 $uninstallScript = Join-Path $scriptDir 'Remove-SingleApplication.hybrid.ps1'
+$mapAppNameScript = Join-Path $parentDir 'helpers\Map-AppName.ps1'
+$mapCsvPath = Join-Path $parentDir 'results\store_app_mappings.csv'
 
 if (-not (Test-Path $jsonPath)) {
     Write-Error "JSON file not found: $jsonPath"
@@ -64,6 +69,11 @@ if (-not (Test-Path $uninstallScript)) {
     Write-Error "Uninstall script not found: $uninstallScript"
     exit 1
 }
+if (-not (Test-Path $mapAppNameScript)) {
+    Write-Error "Map-AppName script not found: $mapAppNameScript"
+    exit 1
+}
+. $mapAppNameScript
 
 # Ensure .\results\screen_records exists in parent directory
 $recDir = Join-Path $parentDir 'results\screen_records'
@@ -140,10 +150,12 @@ $jsonContent = Get-Content $jsonPath -Raw | ConvertFrom-Json
 $apps = @()
 if ($jsonContent -is [Array]) {
     $apps = $jsonContent | ForEach-Object {
-        [PSCustomObject]@{ Name = $_.itemName; ID = $_.itemID }
+        $categories = if ($_.categories) { ($_.categories -join ';') } else { '' }
+        [PSCustomObject]@{ Name = $_.itemName; ID = $_.itemID; Categories = $categories }
     }
 } elseif ($jsonContent.itemID) {
-    $apps = @([PSCustomObject]@{ Name = $jsonContent.itemName; ID = $jsonContent.itemID })
+    $categories = if ($jsonContent.categories) { ($jsonContent.categories -join ';') } else { '' }
+    $apps = @([PSCustomObject]@{ Name = $jsonContent.itemName; ID = $jsonContent.itemID; Categories = $categories })
 } else {
     Write-Error "JSON does not contain 'itemID' fields."
     exit 1
@@ -481,84 +493,15 @@ function Write-RestoreSummary {
     Write-Log "=== Invoke-Hybrid finished: $(Get-Date) ==="
     Write-Host ""
     Write-Host "Log saved to: $logPath"
+    Write-Host "Mapping CSV: $mapCsvPath"
 }
 
-$mitmCA = "$env:USERPROFILE\.mitmproxy\mitmproxy-ca-cert.pem"
-$env:SSL_CERT_FILE = $mitmCA
-$env:REQUESTS_CA_BUNDLE = $mitmCA
-
-function Start-Mitmdump {
-    param(
-        [string]$OutFile,
-        [string]$Mode = "local",
-        [string[]]$IgnoreHosts = @(),
-        [string]$LogFile = ""
-    )
-
-    if (-not (Get-Command mitmdump -ErrorAction SilentlyContinue)) {
-        throw "mitmdump not found on PATH."
-    }
-
-    # Windows Update (*.update.microsoft.com) is signed by Microsoft ECC Update
-    # Secure Server CA 2.1, which Windows trusts and mitmproxy's CA bundle does not.
-    $mitmArgs = @("--mode", $Mode, "--ssl-insecure", "-w", $OutFile)
-    foreach ($pat in $IgnoreHosts) {
-        $mitmArgs += @("--ignore-hosts", $pat)
-    }
-
-    $quotedArgs = $mitmArgs | ForEach-Object {
-        if ($_ -match '\s') { '"' + ($_ -replace '"','""') + '"' } else { $_ }
-    }
-    $argString = $quotedArgs -join ' '
-
-    Write-Log "  Start-Process mitmdump $argString"
-
-    $startParams = @{
-        FilePath     = "mitmdump"
-        ArgumentList = $argString
-        WindowStyle  = 'Hidden'
-        PassThru     = $true
-    }
-
-    if ($LogFile) {
-        $errPath = [IO.Path]::ChangeExtension($LogFile, ".err.log")
-        $startParams.RedirectStandardError  = $errPath
-        $startParams.RedirectStandardOutput = $LogFile
-    }
-
-    Start-Process @startParams
+$mitmproxyScript = Join-Path $parentDir 'helpers\Mitmproxy.ps1'
+if (-not (Test-Path $mitmproxyScript)) {
+    Write-Error "Mitmproxy helper not found: $mitmproxyScript"
+    exit 1
 }
-
-function Wait-MitmdumpReady {
-    param(
-        $Process,
-        [string]$LogFile,
-        [int]$TimeoutSeconds = 20
-    )
-
-    # Start-Process returns before --mode local has attached WinDivert.
-    # Winget's Store request is aborted if that attach happens mid-request.
-    if (-not $Process) { return $false }
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        try { $Process.Refresh() } catch { }
-        if ($Process.HasExited) { return $false }
-        if ($LogFile -and (Test-Path -LiteralPath $LogFile)) {
-            $ready = Select-String -LiteralPath $LogFile -Pattern 'Local redirector started' -Quiet -ErrorAction SilentlyContinue
-            if ($ready) { return $true }
-        }
-        Start-Sleep -Milliseconds 200
-    }
-    return $false
-}
-
-function Stop-Mitmdump {
-    param($Process)
-    if ($Process -and -not $Process.HasExited) {
-        Stop-Process -Id $Process.Id -Force
-        Start-Sleep -Milliseconds 250
-    }
-}
+. $mitmproxyScript
 
 function Stop-ScreenRecording {
     $pidFile = Join-Path $env:TEMP "screenrec_ffmpeg.pid"
@@ -769,22 +712,6 @@ function Stop-NewAppProcesses {
         $mitmId = [int]$script:MitmProc.Id
     }
     Stop-NewProcessesExceptRecording -BaselinePids $script:BaselinePids -RecordingPid $recId -MitmPid $mitmId -AppName $AppName
-}
-
-function Stop-MitmCapture {
-    if ($script:MitmStopped) { return }
-    $script:MitmStopped = $true
-    $proc = $script:MitmProc
-    if (-not $proc) { return }
-    Stop-Mitmdump -Process $proc
-    $script:MitmProc = $null
-    $dumpFile = $script:MitmDumpFile
-    if ($dumpFile -and (Test-Path -LiteralPath $dumpFile)) {
-        $dumpSize = (Get-Item -LiteralPath $dumpFile).Length
-        Write-Log "  Mitmdump stopped; output saved to $dumpFile (size: $dumpSize bytes)"
-    } elseif ($dumpFile) {
-        Warn "Mitmdump output file not found at $dumpFile"
-    }
 }
 
 function Start-NetworkStackCapture {
@@ -1131,6 +1058,7 @@ function Disable-TestSessionTweaks {
 
 Write-Log "=== Invoke-Hybrid started: $(Get-Date) ==="
 Write-Log "Loaded $($apps.Count) app(s) from $jsonPath"
+Write-Log "Mapping CSV: $mapCsvPath"
 
 Initialize-TestRestorePoint
 Repair-RestoreSession
@@ -1254,42 +1182,10 @@ try {
         $script:RecordingPid = $recordingPid
 
         $stem = ($label -replace '[^a-zA-Z0-9]', '_')
-        $dumpFile = Join-Path $netdumpDir "$stem.mitm"
         $etlFile = Join-Path $etlDir "$stem.etl"
-        $mitmLogPath = Join-Path $mitmLogDir "$stem.mitmdump.log"
-        $script:MitmDumpFile = $dumpFile
-        if (Test-Path -LiteralPath $mitmLogPath) {
-            Remove-Item -LiteralPath $mitmLogPath -Force -ErrorAction SilentlyContinue
-        }
-        try {
-            $script:MitmProc = Start-Mitmdump -OutFile $dumpFile -Mode local -IgnoreHosts @(
-                '(^|\.)generativelanguage\.googleapis\.com$', '(^|\.)gradio\.live$'
-            ) -LogFile $mitmLogPath
-            if ($script:MitmProc) {
-                Write-Log "  mitmdump PID $($script:MitmProc.Id) writing to $dumpFile"
-            } else {
-                Warn "mitmdump failed to start; no process object returned."
-            }
-            $mitmReady = Wait-MitmdumpReady -Process $script:MitmProc -LogFile $mitmLogPath
-            if ($script:MitmProc -and $script:MitmProc.HasExited) {
-                $code = $script:MitmProc.ExitCode
-                Warn "mitmdump exited immediately with code $code"
-                if (Test-Path -LiteralPath $mitmLogPath) {
-                    $tail = Get-Content -LiteralPath $mitmLogPath -Tail 20 -ErrorAction SilentlyContinue
-                    foreach ($line in $tail) { Warn "mitmdump: $line" }
-                }
-            } elseif ($script:MitmProc -and -not $mitmReady) {
-                Warn "mitmdump local redirector was not ready after 20s. Store install may be aborted."
-            } elseif ($mitmReady) {
-                Write-Log "  mitmdump local redirector is ready."
-            }
-            if ($script:MitmProc -and -not $script:MitmProc.HasExited) {
-                $stackTemp = Join-Path $networkStackTempDir $stem
-                Start-NetworkStackCapture -TempDirectory $stackTemp -EtlFile $etlFile
-            }
-        } catch {
-            Warn "mitmdump failed to start: $($_.Exception.Message)"
-            $script:MitmProc = $null
+        if (Start-MitmCapture -Stem $stem -NetdumpDir $netdumpDir -LogDir $mitmLogDir -IgnoreHosts $MitmIgnoreHostsCommon) {
+            $stackTemp = Join-Path $networkStackTempDir $stem
+            Start-NetworkStackCapture -TempDirectory $stackTemp -EtlFile $etlFile
         }
 
         Write-Log ""
@@ -1300,6 +1196,16 @@ try {
 
         $restoreThisApp = $false
         try {
+            # Snapshot packages before install so the diff can see only what this install added.
+            $preInstall = $null
+            $mappedApp = $null
+            try {
+                Write-Log "  Pre-install package snapshot."
+                $preInstall = Get-PreInstallSnapshot
+            } catch {
+                Warn "Pre-install snapshot failed: $($_.Exception.Message)"
+            }
+
             # -- STEP 1: INSTALL (same approach as scripts/install.ps1) --
             Write-Host "  Installing..."
 
@@ -1377,6 +1283,30 @@ try {
 
             Write-Log $installLog
 
+            if ($preInstall) {
+                try {
+                    $installDiff = Get-SnapshotDiff -Before $preInstall -PreferredName $app.Name
+                    $mappedApp = Get-InstalledAppData -Diff $installDiff
+                    $processList = (@($mappedApp.AllProcesses) | Where-Object { $_ }) -join ';'
+                    Write-Log "  Mapped install: InstalledName='$($mappedApp.InstalledName)' PrimaryProcess='$($mappedApp.PrimaryProcess)' AllProcesses='$processList' AppType=$($mappedApp.AppType) PackageId=$($mappedApp.PackageId)"
+                    $mapRow = [PSCustomObject]@{
+                        Timestamp      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                        StoreId        = $app.ID
+                        StoreName      = $app.Name
+                        InstalledName  = $mappedApp.InstalledName
+                        PrimaryProcess = $mappedApp.PrimaryProcess
+                        AllProcesses   = $processList
+                        AppType        = $mappedApp.AppType
+                        Categories     = $app.Categories
+                        PackageId      = $mappedApp.PackageId
+                    }
+                    $mapRow | Export-Csv -Path $mapCsvPath -Append -NoTypeInformation
+                    Write-Log "  Mapping row saved to $mapCsvPath"
+                } catch {
+                    Warn "Package mapping failed: $($_.Exception.Message)"
+                }
+            }
+
             # -- STEP 2: silent uninstall, or restore when there is none --
             if ($status -eq 'exist' -or $status -eq 'failure') {
                 Write-Log "  Skipping uninstall and restore - app already existed or installation failed."
@@ -1404,7 +1334,21 @@ try {
                 $uiBefore = Get-VisibleWindowMap
 
                 try {
-                    $uniOutput = & $uninstallScript -ApplicationName $appName -Id $app.ID *>&1
+                    $uniArgs = @{
+                        ApplicationName = $appName
+                        Id              = $app.ID
+                    }
+                    $sidePackage = '^(Microsoft\.Winget\.Source_|Microsoft\.WindowsAppRuntime|Microsoft\.VCLibs|Microsoft\.UI\.Xaml|Microsoft\.NET\.Native)'
+                    if ($mappedApp -and $mappedApp.PackageId -and $mappedApp.AppType -and $mappedApp.AppType -ne 'FAILED_OR_NOT_DETECTED') {
+                        if ($mappedApp.PackageId -match $sidePackage) {
+                            Write-Log "  Mapped package is a runtime dependency; using name lookup instead."
+                        } else {
+                            $uniArgs.PackageId = [string]$mappedApp.PackageId
+                            $uniArgs.AppType = [string]$mappedApp.AppType
+                            Write-Log "  Uninstall target from package diff: AppType=$($mappedApp.AppType) PackageId=$($mappedApp.PackageId)"
+                        }
+                    }
+                    $uniOutput = & $uninstallScript @uniArgs *>&1
                     $uniExit = $LASTEXITCODE
                 }
                 catch {

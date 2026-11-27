@@ -9,7 +9,13 @@ param(
     [string]$ApplicationName,
 
     [Parameter(Mandatory=$false, HelpMessage="Package id, included in the restore message when lookup fails")]
-    [string]$Id
+    [string]$Id,
+
+    [Parameter(Mandatory=$false, HelpMessage="Package identity from the pre/post install diff")]
+    [string]$PackageId,
+
+    [Parameter(Mandatory=$false, HelpMessage="AppType from the pre/post install diff: MSIX, DesktopBridge, PWA, Win32, Squirrel, Portable")]
+    [string]$AppType
 )
 
 # ---- Registry lookup (reused from Find-AppUninstallInfo.ps1) ----
@@ -274,6 +280,31 @@ function Find-RegistryMatch([string]$ApplicationName) {
 }
 
 # ---- Find matching application (Win32 registry, Squirrel, then Store/MSIX) ----
+# A package diff identity targets the app this install added. Name lookup stays
+# the fallback when that package is already gone.
+$mappedAppx = $null
+$mappedWin32 = $null
+if ($PackageId -and $AppType -match '^(MSIX|DesktopBridge|PWA)$') {
+    $candidates = @(Get-AppxPackage -ErrorAction SilentlyContinue)
+    if (Test-IsProcessElevated) {
+        $candidates += @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)
+    }
+    $mappedAppx = $candidates |
+        Where-Object { $_.PackageFullName -eq $PackageId } |
+        Sort-Object PackageFullName -Unique |
+        Select-Object -First 1
+    if (-not $mappedAppx) {
+        Write-Host "Mapped package '$PackageId' is not installed. Falling back to name lookup."
+    }
+} elseif ($PackageId -and $AppType -match '^(Win32|Squirrel)$') {
+    $mappedWin32 = @(Get-UninstallRegistryApps) |
+        Where-Object { $_.PSChildName -eq $PackageId } |
+        Select-Object -First 1
+    if (-not $mappedWin32) {
+        Write-Host "Mapped uninstall key '$PackageId' is not present. Falling back to name lookup."
+    }
+}
+
 # Store/Win32 bootstrappers (Discord) often finish after winget reports success.
 $needle = Normalize-Name $ApplicationName
 $match = @()
@@ -284,6 +315,7 @@ $storeScore = 0
 $maxLookupAttempts = 6
 
 for ($lookupTry = 1; $lookupTry -le $maxLookupAttempts; $lookupTry++) {
+    if ($mappedAppx -or $mappedWin32) { break }
     $regHit = Find-RegistryMatch $ApplicationName
     $match = @($regHit.Match)
     $regScore = [int]$regHit.Score
@@ -320,6 +352,14 @@ for ($lookupTry = 1; $lookupTry -le $maxLookupAttempts; $lookupTry++) {
     }
 }
 
+if ($mappedAppx) {
+    $storePkg = $mappedAppx
+    $match = @()
+} elseif ($mappedWin32) {
+    $match = @($mappedWin32)
+    $storePkg = $null
+}
+
 # ---- Logging setup ----
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
@@ -351,6 +391,7 @@ if ($storePkg) {
     } catch { }
 
     Write-Host "Application found : $displayName (v$($storePkg.Version)) [Store/MSIX]"
+    if ($mappedAppx) { Write-Host "Mapped package: $($storePkg.PackageFullName)" }
     Write-Host "Using Remove-AppxPackage: $($storePkg.PackageFullName)"
     Write-UninstallMethod 'Remove-AppxPackage'
     if (Test-IsProcessElevated) {
