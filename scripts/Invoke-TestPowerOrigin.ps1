@@ -1,10 +1,12 @@
 # Invoke-TestPower.ps1
 # For each app in result/app_1.json:
 #   1. Snapshot pre-ID, start recording, start mitm, start network stack trace
-#   2. Install it  (same logic as scripts/install.ps1)
+#   2. Snapshot installed packages, install (same logic as scripts/install.ps1),
+#      then diff that snapshot, map the new app, and append a row to results\store_app_mappings.csv
 #   3. Stop new processes (except recorder and mitm), then uninstall
-#      if it was NOT already installed ('exist')
-#      using scripts/Remove-SingleApplication.ps1
+#      if it was NOT already installed ('exist').
+#      The package diff from helpers/Map-AppName.ps1 is passed through so
+#      Remove-SingleApplication removes that package instead of a same-named app.
 #   4. Wait until the uninstall window is gone
 #   5. Stop leftover processes, stop network stack trace, stop mitm, then stop recording
 # Then move on to the next app.
@@ -15,8 +17,10 @@ if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
 $parentDir = Split-Path -Parent $scriptDir
 if (-not $parentDir) { $parentDir = (Get-Location).Path }
 
-$jsonPath          = Join-Path $parentDir 'results\app_test.json'
+$jsonPath          = Join-Path $parentDir 'results\apps_test.json'
 $uninstallScript   = Join-Path $scriptDir 'Remove-SingleApplication.new.ps1'
+$mapAppNameScript  = Join-Path $parentDir 'helpers\Map-AppName.ps1'
+$mapCsvPath        = Join-Path $parentDir 'results\store_app_mappings.csv'
 
 # Validate required files
 if (-not (Test-Path $jsonPath)) {
@@ -27,6 +31,11 @@ if (-not (Test-Path $uninstallScript)) {
     Write-Error "Uninstall script not found: $uninstallScript"
     exit 1
 }
+if (-not (Test-Path $mapAppNameScript)) {
+    Write-Error "Map-AppName script not found: $mapAppNameScript"
+    exit 1
+}
+. $mapAppNameScript
 
 # Ensure .\results\screen_records exists in parent directory
 $recDir = Join-Path $parentDir 'results\screen_records'
@@ -87,10 +96,12 @@ $jsonContent = Get-Content $jsonPath -Raw | ConvertFrom-Json
 $apps = @()
 if ($jsonContent -is [Array]) {
     $apps = $jsonContent | ForEach-Object {
-        [PSCustomObject]@{ Name = $_.itemName; ID = $_.itemID }
+        $categories = if ($_.categories) { ($_.categories -join ';') } else { '' }
+        [PSCustomObject]@{ Name = $_.itemName; ID = $_.itemID; Categories = $categories }
     }
 } elseif ($jsonContent.itemID) {
-    $apps = @([PSCustomObject]@{ Name = $jsonContent.itemName; ID = $jsonContent.itemID })
+    $categories = if ($jsonContent.categories) { ($jsonContent.categories -join ';') } else { '' }
+    $apps = @([PSCustomObject]@{ Name = $jsonContent.itemName; ID = $jsonContent.itemID; Categories = $categories })
 } else {
     Write-Error "JSON does not contain 'itemID' fields."
     exit 1
@@ -98,6 +109,7 @@ if ($jsonContent -is [Array]) {
 
 Write-Log "=== Invoke-TestPower started: $(Get-Date) ==="
 Write-Log "Loaded $($apps.Count) app(s) from $jsonPath"
+Write-Log "Mapping CSV: $mapCsvPath"
 
 # Counters for final summary
 $totalExist   = 0
@@ -803,7 +815,10 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
     }
     try {
         $script:MitmProc = Start-Mitmdump -OutFile $dumpFile -Mode local -IgnoreHosts @(
-            '(^|\.)generativelanguage\.googleapis\.com$', '(^|\.)gradio\.live$'
+            '(^|\.)generativelanguage\.googleapis\.com(:\d+)?$', '(^|\.)gradio\.live(:\d+)?$',
+            '(^|\.)delivery\.mp\.microsoft\.com(:\d+)?$', '(^|\.)update\.microsoft\.com(:\d+)?$', '(^|\.)windowsupdate\.com(:\d+)?$',
+            '(^|\.)licensing\.mp\.microsoft\.com(:\d+)?$', '(^|\.)dsx\.mp\.microsoft\.com(:\d+)?$', '(^|\.)collections\.mp\.microsoft\.com(:\d+)?$',
+            '(^|\.)md\.mp\.microsoft\.com(:\d+)?$', '(^|\.)commerce\.microsoft\.com(:\d+)?$', '(^|\.)dsp\.mp\.microsoft\.com(:\d+)?$'
         ) -LogFile $mitmLogPath
         if ($script:MitmProc) {
             Write-Log "  mitmdump PID $($script:MitmProc.Id) writing to $dumpFile"
@@ -837,6 +852,16 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
     Write-Log "[$($i + 1)/$($apps.Count)] $label"
     Write-Log "------------------------------------------------"
     Write-Log "  Pre-ID count: $(@($script:BaselinePids).Count)"
+
+    # Snapshot packages before install so the diff can see only what this install added.
+    $preInstall = $null
+    $mappedApp = $null
+    try {
+        Write-Log "  Pre-install package snapshot."
+        $preInstall = Get-PreInstallSnapshot
+    } catch {
+        Warn "Pre-install snapshot failed: $($_.Exception.Message)"
+    }
 
     # -- STEP 1: INSTALL (same approach as scripts/install.ps1) --
     Write-Host "  Installing..."
@@ -913,6 +938,30 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
 
     Write-Log $installLog
 
+    if ($preInstall) {
+        try {
+            $installDiff = Get-SnapshotDiff -Before $preInstall -PreferredName $app.Name
+            $mappedApp = Get-InstalledAppData -Diff $installDiff
+            $processList = (@($mappedApp.AllProcesses) | Where-Object { $_ }) -join ';'
+            Write-Log "  Mapped install: InstalledName='$($mappedApp.InstalledName)' PrimaryProcess='$($mappedApp.PrimaryProcess)' AllProcesses='$processList' AppType=$($mappedApp.AppType) PackageId=$($mappedApp.PackageId)"
+            $mapRow = [PSCustomObject]@{
+                Timestamp      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                StoreId        = $app.ID
+                StoreName      = $app.Name
+                InstalledName  = $mappedApp.InstalledName
+                PrimaryProcess = $mappedApp.PrimaryProcess
+                AllProcesses   = $processList
+                AppType        = $mappedApp.AppType
+                Categories     = $app.Categories
+                PackageId      = $mappedApp.PackageId
+            }
+            $mapRow | Export-Csv -Path $mapCsvPath -Append -NoTypeInformation
+            Write-Log "  Mapping row saved to $mapCsvPath"
+        } catch {
+            Warn "Package mapping failed: $($_.Exception.Message)"
+        }
+    }
+
     # -- STEP 2: UNINSTALL (only if NOT 'exist' or 'failure') --
     if ($status -eq 'exist' -or $status -eq 'failure') {
         Write-Log "  Skipping uninstall - app already existed or installation failed."
@@ -949,7 +998,21 @@ for ($i = 0; $i -lt $apps.Count; $i++) {
 
     try {
         # *>&1 captures Write-Host (information stream) as well as success and error output.
-        $uniOutput = & $uninstallScript -ApplicationName $appName -Id $app.ID *>&1
+        $uniArgs = @{
+            ApplicationName = $appName
+            Id              = $app.ID
+        }
+        $sidePackage = '^(Microsoft\.Winget\.Source_|Microsoft\.WindowsAppRuntime|Microsoft\.VCLibs|Microsoft\.UI\.Xaml|Microsoft\.NET\.Native)'
+        if ($mappedApp -and $mappedApp.PackageId -and $mappedApp.AppType -and $mappedApp.AppType -ne 'FAILED_OR_NOT_DETECTED') {
+            if ($mappedApp.PackageId -match $sidePackage) {
+                Write-Log "  Mapped package is a runtime dependency; using name lookup instead."
+            } else {
+                $uniArgs.PackageId = [string]$mappedApp.PackageId
+                $uniArgs.AppType = [string]$mappedApp.AppType
+                Write-Log "  Uninstall target from package diff: AppType=$($mappedApp.AppType) PackageId=$($mappedApp.PackageId)"
+            }
+        }
+        $uniOutput = & $uninstallScript @uniArgs *>&1
         $uniExit   = $LASTEXITCODE
     }
     catch {
@@ -1044,3 +1107,4 @@ foreach ($name in $uniMethodNames) {
 Write-Log "=== Invoke-TestPower finished: $(Get-Date) ==="
 Write-Host ""
 Write-Host "Log saved to: $logPath"
+Write-Host "Mapping CSV: $mapCsvPath"
